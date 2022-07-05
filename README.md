@@ -18,12 +18,6 @@
   </p>
 </div>
 
-**Heads up for contributors: upcoming edition change**
-
-We're currently preparing to bump MSRV and **change the edition to 2018**.
-To minimize the churn we recommend you to submit your local WIP changes ASAP.
-There will be a lot of rebasing after the edition change.
-
 [Documentation](https://docs.rs/bitcoin/)
 
 Supports (or should support)
@@ -107,6 +101,13 @@ cargo test
 
 Please refer to the [`cargo` documentation](https://doc.rust-lang.org/stable/cargo/) for more detailed instructions.
 
+### Building the docs
+
+We build docs with the nightly toolchain, you may wish to use the following
+shell alias to check your documentation changes build correctly.
+
+```alias build-docs='RUSTDOCFLAGS="--cfg docsrs" cargo +nightly rustdoc --features="$FEATURES" -- -D rustdoc::broken-intra-doc-links'```
+
 ## Pull Requests
 
 Every PR needs at least two reviews to get merged. During the review phase
@@ -123,6 +124,17 @@ In order to speed up the review process the CI pipeline can be run locally using
 [act](https://github.com/nektos/act). The `fuzz` and `Cross` jobs will be
 skipped when using `act` due to caching being unsupported at this time. We do
 not *actively* support `act` but will merge PRs fixing `act` issues.
+
+### Githooks
+
+To assist devs in catching errors _before_ running CI we provide some githooks. If you do not
+already have locally configured githooks you can use the ones in this repository by running, in the
+root directory of the repository:
+```
+git config --local core.hooksPath githooks/
+```
+
+Alternatively add symlinks in your `.git/hooks` directory to any of the githooks we provide.
 
 ## Policy on Altcoins/Altchains
 

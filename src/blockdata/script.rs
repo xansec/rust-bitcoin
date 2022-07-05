@@ -26,6 +26,7 @@
 use crate::prelude::*;
 
 use crate::io;
+use core::convert::TryFrom;
 use core::{fmt, default::Default};
 use core::ops::Index;
 
@@ -46,7 +47,20 @@ use crate::util::taproot::{LeafVersion, TapBranchHash, TapLeafHash};
 use secp256k1::{Secp256k1, Verification, XOnlyPublicKey};
 use crate::schnorr::{TapTweak, TweakedPublicKey, UntweakedPublicKey};
 
-/// A Bitcoin script.
+/// Bitcoin script.
+///
+/// A list of instructions in a simple, [Forth]-like, stack-based programming language
+/// that Bitcoin uses.
+///
+/// [Forth]: https://en.wikipedia.org/wiki/Forth_(programming_language)
+///
+/// See [Bitcoin Wiki: Script][wiki-script] for more information.
+///
+/// [wiki-script]: https://en.bitcoin.it/wiki/Script
+///
+/// ### Bitcoin Core References
+///
+/// * [CScript definition](https://github.com/bitcoin/bitcoin/blob/d492dc1cdaabdc52b0766bf4cba4bd73178325d0/src/script/script.h#L410)
 #[derive(Clone, Default, PartialOrd, Ord, PartialEq, Eq, Hash)]
 pub struct Script(Box<[u8]>);
 
@@ -137,6 +151,7 @@ where
 /// much as it could be; patches welcome if more detailed errors
 /// would help you.
 #[derive(PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Clone, Copy)]
+#[non_exhaustive]
 pub enum Error {
     /// Something did a non-minimal push; for more information see
     /// `https://github.com/bitcoin/bips/blob/master/bip-0062.mediawiki#Push_operators`
@@ -146,31 +161,14 @@ pub enum Error {
     /// Tried to read an array off the stack as a number when it was more than 4 bytes
     NumericOverflow,
     /// Error validating the script with bitcoinconsensus library
-    BitcoinConsensus(BitcoinConsensusError),
+    #[cfg(feature = "bitcoinconsensus")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "bitcoinconsensus")))]
+    BitcoinConsensus(bitcoinconsensus::Error),
     /// Can not find the spent output
     UnknownSpentOutput(OutPoint),
     /// Can not serialize the spending transaction
     SerializationError
 }
-
-/// A [`bitcoinconsensus::Error`] alias. Exists to enable the compiler to ensure `bitcoinconsensus`
-/// feature gating is correct.
-#[cfg(feature = "bitcoinconsensus")]
-#[cfg_attr(docsrs, doc(cfg(feature = "bitcoinconsensus")))]
-pub type BitcoinConsensusError = bitcoinconsensus::Error;
-
-/// Dummy error type used when `bitcoinconsensus` feature is not enabled.
-#[cfg(not(feature = "bitcoinconsensus"))]
-#[cfg_attr(docsrs, doc(cfg(not(feature = "bitcoinconsensus"))))]
-#[derive(PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Clone, Copy)]
-pub struct BitcoinConsensusError {
-    _uninhabited: Uninhabited,
-}
-
-#[cfg(not(feature = "bitcoinconsensus"))]
-#[cfg_attr(docsrs, doc(cfg(not(feature = "bitcoinconsensus"))))]
-#[derive(PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Clone, Copy)]
-enum Uninhabited {}
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -178,6 +176,7 @@ impl fmt::Display for Error {
             Error::NonMinimalPush => "non-minimal datapush",
             Error::EarlyEndOfScript => "unexpected end of script",
             Error::NumericOverflow => "numeric overflow (number on stack larger than 4 bytes)",
+            #[cfg(feature = "bitcoinconsensus")]
             Error::BitcoinConsensus(ref _n) => "bitcoinconsensus verification failed",
             Error::UnknownSpentOutput(ref _point) => "unknown spent output Transaction::verify()",
             Error::SerializationError => "can not serialize the spending transaction in Transaction::verify()",
@@ -196,9 +195,10 @@ impl std::error::Error for Error {
             NonMinimalPush
             | EarlyEndOfScript
             | NumericOverflow
-            | BitcoinConsensus(_) // TODO: This should return `Some` but bitcoinconsensus::Error does not implement Error.
             | UnknownSpentOutput(_)
             | SerializationError => None,
+            #[cfg(feature = "bitcoinconsensus")]
+            BitcoinConsensus(_) => None,
         }
     }
 }
@@ -226,30 +226,36 @@ impl From<bitcoinconsensus::Error> for Error {
         Error::BitcoinConsensus(err)
     }
 }
-/// Helper to encode an integer in script format
-fn build_scriptint(n: i64) -> Vec<u8> {
-    if n == 0 { return vec![] }
+
+/// Helper to encode an integer in script format.
+/// Writes bytes into the buffer and returns the number of bytes written.
+fn write_scriptint(out: &mut [u8; 8], n: i64) -> usize {
+    let mut len = 0;
+    if n == 0 { return len; }
 
     let neg = n < 0;
 
     let mut abs = if neg { -n } else { n } as usize;
-    let mut v = vec![];
     while abs > 0xFF {
-        v.push((abs & 0xFF) as u8);
+        out[len] = (abs & 0xFF) as u8;
+        len += 1;
         abs >>= 8;
     }
     // If the number's value causes the sign bit to be set, we need an extra
     // byte to get the correct value and correct sign bit
     if abs & 0x80 != 0 {
-        v.push(abs as u8);
-        v.push(if neg { 0x80u8 } else { 0u8 });
+        out[len] = abs as u8;
+        len += 1;
+        out[len] = if neg { 0x80u8 } else { 0u8 };
+        len += 1;
     }
     // Otherwise we just set the sign bit ourselves
     else {
         abs |= if neg { 0x80 } else { 0 };
-        v.push(abs as u8);
+        out[len] = abs as u8;
+        len += 1;
     }
-    v
+    len
 }
 
 /// Helper to decode an integer in script format
@@ -469,35 +475,35 @@ impl Script {
     /// the current script, assuming that the script is a Tapscript.
     #[inline]
     pub fn to_v1_p2tr<C: Verification>(&self, secp: &Secp256k1<C>, internal_key: UntweakedPublicKey) -> Script {
-        let leaf_hash = TapLeafHash::from_script(&self, LeafVersion::TapScript);
+        let leaf_hash = TapLeafHash::from_script(self, LeafVersion::TapScript);
         let merkle_root = TapBranchHash::from_inner(leaf_hash.into_inner());
-        Script::new_v1_p2tr(&secp, internal_key, Some(merkle_root))
+        Script::new_v1_p2tr(secp, internal_key, Some(merkle_root))
     }
 
     /// Returns witness version of the script, if any, assuming the script is a `scriptPubkey`.
     #[inline]
     pub fn witness_version(&self) -> Option<WitnessVersion> {
-        self.0.get(0).and_then(|opcode| WitnessVersion::from_opcode(opcodes::All::from(*opcode)).ok())
+        self.0.get(0).and_then(|opcode| WitnessVersion::try_from(opcodes::All::from(*opcode)).ok())
     }
 
     /// Checks whether a script pubkey is a P2SH output.
     #[inline]
     pub fn is_p2sh(&self) -> bool {
         self.0.len() == 23
-            && self.0[0] == opcodes::all::OP_HASH160.into_u8()
-            && self.0[1] == opcodes::all::OP_PUSHBYTES_20.into_u8()
-            && self.0[22] == opcodes::all::OP_EQUAL.into_u8()
+            && self.0[0] == opcodes::all::OP_HASH160.to_u8()
+            && self.0[1] == opcodes::all::OP_PUSHBYTES_20.to_u8()
+            && self.0[22] == opcodes::all::OP_EQUAL.to_u8()
     }
 
     /// Checks whether a script pubkey is a P2PKH output.
     #[inline]
     pub fn is_p2pkh(&self) -> bool {
         self.0.len() == 25
-            && self.0[0] == opcodes::all::OP_DUP.into_u8()
-            && self.0[1] == opcodes::all::OP_HASH160.into_u8()
-            && self.0[2] == opcodes::all::OP_PUSHBYTES_20.into_u8()
-            && self.0[23] == opcodes::all::OP_EQUALVERIFY.into_u8()
-            && self.0[24] == opcodes::all::OP_CHECKSIG.into_u8()
+            && self.0[0] == opcodes::all::OP_DUP.to_u8()
+            && self.0[1] == opcodes::all::OP_HASH160.to_u8()
+            && self.0[2] == opcodes::all::OP_PUSHBYTES_20.to_u8()
+            && self.0[23] == opcodes::all::OP_EQUALVERIFY.to_u8()
+            && self.0[24] == opcodes::all::OP_CHECKSIG.to_u8()
     }
 
     /// Checks whether a script pubkey is a P2PK output.
@@ -505,12 +511,12 @@ impl Script {
     pub fn is_p2pk(&self) -> bool {
         match self.len() {
             67 => {
-                self.0[0] == opcodes::all::OP_PUSHBYTES_65.into_u8()
-                    && self.0[66] == opcodes::all::OP_CHECKSIG.into_u8()
+                self.0[0] == opcodes::all::OP_PUSHBYTES_65.to_u8()
+                    && self.0[66] == opcodes::all::OP_CHECKSIG.to_u8()
             }
             35 => {
-                self.0[0] == opcodes::all::OP_PUSHBYTES_33.into_u8()
-                    && self.0[34] == opcodes::all::OP_CHECKSIG.into_u8()
+                self.0[0] == opcodes::all::OP_PUSHBYTES_33.to_u8()
+                    && self.0[34] == opcodes::all::OP_CHECKSIG.to_u8()
             }
             _ => false
         }
@@ -524,14 +530,14 @@ impl Script {
         // special meaning. The value of the first push is called the "version byte". The following
         // byte vector pushed is called the "witness program".
         let script_len = self.0.len();
-        if script_len < 4 || script_len > 42 {
+        if !(4..=42).contains(&script_len) {
             return false
         }
         let ver_opcode = opcodes::All::from(self.0[0]); // Version 0 or PUSHNUM_1-PUSHNUM_16
         let push_opbyte = self.0[1]; // Second byte push opcode 2-40 bytes
-        WitnessVersion::from_opcode(ver_opcode).is_ok()
-            && push_opbyte >= opcodes::all::OP_PUSHBYTES_2.into_u8()
-            && push_opbyte <= opcodes::all::OP_PUSHBYTES_40.into_u8()
+        WitnessVersion::try_from(ver_opcode).is_ok()
+            && push_opbyte >= opcodes::all::OP_PUSHBYTES_2.to_u8()
+            && push_opbyte <= opcodes::all::OP_PUSHBYTES_40.to_u8()
             // Check that the rest of the script has the correct size
             && script_len - 2 == push_opbyte as usize
     }
@@ -541,7 +547,7 @@ impl Script {
     pub fn is_v0_p2wsh(&self) -> bool {
         self.0.len() == 34
             && self.witness_version() == Some(WitnessVersion::V0)
-            && self.0[1] == opcodes::all::OP_PUSHBYTES_32.into_u8()
+            && self.0[1] == opcodes::all::OP_PUSHBYTES_32.to_u8()
     }
 
     /// Checks whether a script pubkey is a P2WPKH output.
@@ -549,7 +555,7 @@ impl Script {
     pub fn is_v0_p2wpkh(&self) -> bool {
         self.0.len() == 22
             && self.witness_version() == Some(WitnessVersion::V0)
-            && self.0[1] == opcodes::all::OP_PUSHBYTES_20.into_u8()
+            && self.0[1] == opcodes::all::OP_PUSHBYTES_20.to_u8()
     }
 
     /// Checks whether a script pubkey is a P2TR output.
@@ -557,13 +563,13 @@ impl Script {
     pub fn is_v1_p2tr(&self) -> bool {
         self.0.len() == 34
             && self.witness_version() == Some(WitnessVersion::V1)
-            && self.0[1] == opcodes::all::OP_PUSHBYTES_32.into_u8()
+            && self.0[1] == opcodes::all::OP_PUSHBYTES_32.to_u8()
     }
 
     /// Check if this is an OP_RETURN output.
     pub fn is_op_return (&self) -> bool {
         match self.0.first() {
-            Some(b) => *b == opcodes::all::OP_RETURN.into_u8(),
+            Some(b) => *b == opcodes::all::OP_RETURN.to_u8(),
             None => false
         }
     }
@@ -644,14 +650,14 @@ impl Script {
     #[cfg(feature="bitcoinconsensus")]
     #[cfg_attr(docsrs, doc(cfg(feature = "bitcoinconsensus")))]
     pub fn verify_with_flags<F: Into<u32>>(&self, index: usize, amount: crate::Amount, spending: &[u8], flags: F) -> Result<(), Error> {
-        Ok(bitcoinconsensus::verify_with_flags (&self.0[..], amount.as_sat(), spending, index, flags.into())?)
+        Ok(bitcoinconsensus::verify_with_flags (&self.0[..], amount.to_sat(), spending, index, flags.into())?)
     }
 
     /// Writes the assembly decoding of the script bytes to the formatter.
     pub fn bytes_to_asm_fmt(script: &[u8], f: &mut dyn fmt::Write) -> fmt::Result {
         // This has to be a macro because it needs to break the loop
         macro_rules! read_push_data_len {
-            ($iter:expr, $len:expr, $formatter:expr) => {
+            ($iter:expr, $len:literal, $formatter:expr) => {
                 match read_uint_iter($iter, $len) {
                     Ok(n) => {
                         n
@@ -876,9 +882,9 @@ impl Builder {
     /// dedicated opcodes to push some small integers.
     pub fn push_int(self, data: i64) -> Builder {
         // We can special-case -1, 1-16
-        if data == -1 || (data >= 1 && data <= 16) {
+        if data == -1 || (1..=16).contains(&data) {
             let opcode = opcodes::All::from(
-                (data - 1 + opcodes::OP_TRUE.into_u8() as i64) as u8
+                (data - 1 + opcodes::OP_TRUE.to_u8() as i64) as u8
             );
             self.push_opcode(opcode)
         }
@@ -893,7 +899,9 @@ impl Builder {
     /// Adds instructions to push an integer onto the stack, using the explicit
     /// encoding regardless of the availability of dedicated opcodes.
     pub fn push_scriptint(self, data: i64) -> Builder {
-        self.push_slice(&build_scriptint(data))
+        let mut buf = [0u8; 8];
+        let len = write_scriptint(&mut buf, data);
+        self.push_slice(&buf[..len])
     }
 
     /// Adds instructions to push some arbitrary data onto the stack.
@@ -902,16 +910,16 @@ impl Builder {
         match data.len() as u64 {
             n if n < opcodes::Ordinary::OP_PUSHDATA1 as u64 => { self.0.push(n as u8); },
             n if n < 0x100 => {
-                self.0.push(opcodes::Ordinary::OP_PUSHDATA1.into_u8());
+                self.0.push(opcodes::Ordinary::OP_PUSHDATA1.to_u8());
                 self.0.push(n as u8);
             },
             n if n < 0x10000 => {
-                self.0.push(opcodes::Ordinary::OP_PUSHDATA2.into_u8());
+                self.0.push(opcodes::Ordinary::OP_PUSHDATA2.to_u8());
                 self.0.push((n % 0x100) as u8);
                 self.0.push((n / 0x100) as u8);
             },
             n if n < 0x100000000 => {
-                self.0.push(opcodes::Ordinary::OP_PUSHDATA4.into_u8());
+                self.0.push(opcodes::Ordinary::OP_PUSHDATA4.to_u8());
                 self.0.push((n % 0x100) as u8);
                 self.0.push(((n / 0x100) % 0x100) as u8);
                 self.0.push(((n / 0x10000) % 0x100) as u8);
@@ -941,7 +949,7 @@ impl Builder {
 
     /// Adds a single opcode to the script.
     pub fn push_opcode(mut self, data: opcodes::All) -> Builder {
-        self.0.push(data.into_u8());
+        self.0.push(data.to_u8());
         self.1 = Some(data);
         self
     }
@@ -1062,22 +1070,22 @@ impl serde::Serialize for Script {
         if serializer.is_human_readable() {
             serializer.serialize_str(&format!("{:x}", self))
         } else {
-            serializer.serialize_bytes(&self.as_bytes())
+            serializer.serialize_bytes(self.as_bytes())
         }
     }
 }
 
 impl Encodable for Script {
     #[inline]
-    fn consensus_encode<S: io::Write>(&self, s: S) -> Result<usize, io::Error> {
-        self.0.consensus_encode(s)
+    fn consensus_encode<W: io::Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
+        self.0.consensus_encode(w)
     }
 }
 
 impl Decodable for Script {
     #[inline]
-    fn consensus_decode<D: io::Read>(d: D) -> Result<Self, encode::Error> {
-        Ok(Script(Decodable::consensus_decode(d)?))
+    fn consensus_decode_from_finite_reader<R: io::Read + ?Sized>(r: &mut R) -> Result<Self, encode::Error> {
+        Ok(Script(Decodable::consensus_decode_from_finite_reader(r)?))
     }
 }
 
@@ -1086,7 +1094,7 @@ mod test {
     use core::str::FromStr;
 
     use super::*;
-    use super::build_scriptint;
+    use super::write_scriptint;
 
     use crate::hashes::hex::{FromHex, ToHex};
     use crate::consensus::encode::{deserialize, serialize};
@@ -1267,13 +1275,23 @@ mod test {
 
     #[test]
     fn scriptint_round_trip() {
+        fn build_scriptint(n: i64) -> Vec<u8> {
+            let mut buf = [0u8; 8];
+            let len = write_scriptint(&mut buf, n);
+            assert!(len <= 8);
+            buf[..len].to_vec()
+        }
+
         assert_eq!(build_scriptint(-1), vec![0x81]);
         assert_eq!(build_scriptint(255), vec![255, 0]);
         assert_eq!(build_scriptint(256), vec![0, 1]);
         assert_eq!(build_scriptint(257), vec![1, 1]);
         assert_eq!(build_scriptint(511), vec![255, 1]);
-        for &i in [10, 100, 255, 256, 1000, 10000, 25000, 200000, 5000000, 1000000000,
-                             (1 << 31) - 1, -((1 << 31) - 1)].iter() {
+        let test_vectors = [
+            10, 100, 255, 256, 1000, 10000, 25000, 200000, 5000000, 1000000000,
+            (1 << 31) - 1, -((1 << 31) - 1),
+        ];
+        for &i in test_vectors.iter() {
             assert_eq!(Ok(i), read_scriptint(&build_scriptint(i)));
             assert_eq!(Ok(-i), read_scriptint(&build_scriptint(-i)));
         }
@@ -1291,18 +1309,18 @@ mod test {
     #[test]
     fn provably_unspendable_test() {
         // p2pk
-        assert_eq!(hex_script!("410446ef0102d1ec5240f0d061a4246c1bdef63fc3dbab7733052fbbf0ecd8f41fc26bf049ebb4f9527f374280259e7cfa99c48b0e3f39c51347a19a5819651503a5ac").is_provably_unspendable(), false);
-        assert_eq!(hex_script!("4104ea1feff861b51fe3f5f8a3b12d0f4712db80e919548a80839fc47c6a21e66d957e9c5d8cd108c7a2d2324bad71f9904ac0ae7336507d785b17a2c115e427a32fac").is_provably_unspendable(), false);
+        assert!(!hex_script!("410446ef0102d1ec5240f0d061a4246c1bdef63fc3dbab7733052fbbf0ecd8f41fc26bf049ebb4f9527f374280259e7cfa99c48b0e3f39c51347a19a5819651503a5ac").is_provably_unspendable());
+        assert!(!hex_script!("4104ea1feff861b51fe3f5f8a3b12d0f4712db80e919548a80839fc47c6a21e66d957e9c5d8cd108c7a2d2324bad71f9904ac0ae7336507d785b17a2c115e427a32fac").is_provably_unspendable());
         // p2pkhash
-        assert_eq!(hex_script!("76a914ee61d57ab51b9d212335b1dba62794ac20d2bcf988ac").is_provably_unspendable(), false);
-        assert_eq!(hex_script!("6aa9149eb21980dc9d413d8eac27314938b9da920ee53e87").is_provably_unspendable(), true);
+        assert!(!hex_script!("76a914ee61d57ab51b9d212335b1dba62794ac20d2bcf988ac").is_provably_unspendable());
+        assert!(hex_script!("6aa9149eb21980dc9d413d8eac27314938b9da920ee53e87").is_provably_unspendable());
     }
 
     #[test]
     fn op_return_test() {
-        assert_eq!(hex_script!("6aa9149eb21980dc9d413d8eac27314938b9da920ee53e87").is_op_return(), true);
-        assert_eq!(hex_script!("76a914ee61d57ab51b9d212335b1dba62794ac20d2bcf988ac").is_op_return(), false);
-        assert_eq!(hex_script!("").is_op_return(), false);
+        assert!(hex_script!("6aa9149eb21980dc9d413d8eac27314938b9da920ee53e87").is_op_return());
+        assert!(!hex_script!("76a914ee61d57ab51b9d212335b1dba62794ac20d2bcf988ac").is_op_return());
+        assert!(!hex_script!("").is_op_return());
     }
 
     #[test]

@@ -40,7 +40,6 @@ use crate::prelude::*;
 use crate::io;
 use core::fmt;
 
-use crate::network;
 use crate::consensus::encode;
 
 /// A trait which allows numbers to act as fixed-size bit arrays
@@ -67,11 +66,10 @@ pub trait BitArray {
 /// A general error code, other errors should implement conversions to/from this
 /// if appropriate.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Error {
     /// Encoding error
     Encode(encode::Error),
-    /// Network error
-    Network(network::Error),
     /// The header hash is not below the target
     BlockBadProofOfWork,
     /// The `target` field of a block header did not match the expected difficulty
@@ -81,8 +79,7 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
-            Error::Encode(ref e) => fmt::Display::fmt(e, f),
-            Error::Network(ref e) => fmt::Display::fmt(e, f),
+            Error::Encode(ref e) => write_err!(f, "encoding error"; e),
             Error::BlockBadProofOfWork => f.write_str("block target correct but not attained"),
             Error::BlockBadTarget => f.write_str("block target incorrect"),
         }
@@ -97,9 +94,7 @@ impl std::error::Error for Error {
 
         match self {
             Encode(e) => Some(e),
-            Network(e) => Some(e),
-            BlockBadProofOfWork
-            | BlockBadTarget => None
+            BlockBadProofOfWork | BlockBadTarget => None
         }
     }
 }
@@ -108,13 +103,6 @@ impl std::error::Error for Error {
 impl From<encode::Error> for Error {
     fn from(e: encode::Error) -> Error {
         Error::Encode(e)
-    }
-}
-
-#[doc(hidden)]
-impl From<network::Error> for Error {
-    fn from(e: network::Error) -> Error {
-        Error::Network(e)
     }
 }
 

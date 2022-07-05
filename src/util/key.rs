@@ -31,6 +31,7 @@ use crate::util::base58;
 
 /// A key-related error.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[non_exhaustive]
 pub enum Error {
     /// Base58 encoding error
     Base58(base58::Error),
@@ -45,10 +46,10 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
-            Error::Base58(ref e) => write!(f, "Key base58 error: {}", e),
-            Error::Secp256k1(ref e) => write!(f, "Key secp256k1 error: {}", e),
-            Error::InvalidKeyPrefix(ref e) => write!(f, "Key prefix invalid: {}", e),
-            Error::Hex(ref e) => write!(f, "Key hex decoding error: {}", e)
+            Error::Base58(ref e) => write_err!(f, "key base58 error"; e),
+            Error::Secp256k1(ref e) => write_err!(f, "key secp256k1 error"; e),
+            Error::InvalidKeyPrefix(ref b) => write!(f, "key prefix invalid: {}", b),
+            Error::Hex(ref e) => write_err!(f, "key hex decoding error"; e)
         }
     }
 }
@@ -228,7 +229,7 @@ impl FromStr for PublicKey {
         match s.len() {
             66 => PublicKey::from_slice(&<[u8; 33]>::from_hex(s)?),
             130 => PublicKey::from_slice(&<[u8; 65]>::from_hex(s)?),
-            len => return Err(Error::Hex(hex::Error::InvalidLength(66, len)))
+            len => Err(Error::Hex(hex::Error::InvalidLength(66, len))),
         }
     }
 }
@@ -410,6 +411,7 @@ impl<'de> ::serde::Deserialize<'de> for PrivateKey {
 
 #[cfg(feature = "serde")]
 #[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
+#[allow(clippy::collapsible_else_if)] // Aids readability.
 impl ::serde::Serialize for PublicKey {
     fn serialize<S: ::serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         if s.is_human_readable() {
@@ -496,7 +498,7 @@ mod tests {
         // testnet compressed
         let sk = PrivateKey::from_wif("cVt4o7BGAig1UXywgGSmARhxMdzP5qvQsxKkSsc1XEkw3tDTQFpy").unwrap();
         assert_eq!(sk.network, Testnet);
-        assert_eq!(sk.compressed, true);
+        assert!(sk.compressed);
         assert_eq!(&sk.to_wif(), "cVt4o7BGAig1UXywgGSmARhxMdzP5qvQsxKkSsc1XEkw3tDTQFpy");
 
         let secp = Secp256k1::new();
@@ -512,12 +514,12 @@ mod tests {
         // mainnet uncompressed
         let sk = PrivateKey::from_wif("5JYkZjmN7PVMjJUfJWfRFwtuXTGB439XV6faajeHPAM9Z2PT2R3").unwrap();
         assert_eq!(sk.network, Bitcoin);
-        assert_eq!(sk.compressed, false);
+        assert!(!sk.compressed);
         assert_eq!(&sk.to_wif(), "5JYkZjmN7PVMjJUfJWfRFwtuXTGB439XV6faajeHPAM9Z2PT2R3");
 
         let secp = Secp256k1::new();
         let mut pk = sk.public_key(&secp);
-        assert_eq!(pk.compressed, false);
+        assert!(!pk.compressed);
         assert_eq!(&pk.to_string(), "042e58afe51f9ed8ad3cc7897f634d881fdbe49a81564629ded8156bebd2ffd1af191923a2964c177f5b5923ae500fca49e99492d534aa3759d6b25a8bc971b133");
         assert_eq!(pk, PublicKey::from_str("042e58afe51f9ed8ad3cc7897f634d881fdbe49a81564629ded8156bebd2ffd1af191923a2964c177f5b5923ae500fca49e99492d534aa3759d6b25a8bc971b133").unwrap());
         let addr = Address::p2pkh(&pk, sk.network);
@@ -548,9 +550,9 @@ mod tests {
     fn test_key_serde() {
         use serde_test::{Configure, Token, assert_tokens};
 
-        static KEY_WIF: &'static str = "cVt4o7BGAig1UXywgGSmARhxMdzP5qvQsxKkSsc1XEkw3tDTQFpy";
-        static PK_STR: &'static str = "039b6347398505f5ec93826dc61c19f47c66c0283ee9be980e29ce325a0f4679ef";
-        static PK_STR_U: &'static str = "\
+        static KEY_WIF: &str = "cVt4o7BGAig1UXywgGSmARhxMdzP5qvQsxKkSsc1XEkw3tDTQFpy";
+        static PK_STR: &str = "039b6347398505f5ec93826dc61c19f47c66c0283ee9be980e29ce325a0f4679ef";
+        static PK_STR_U: &str = "\
             04\
             9b6347398505f5ec93826dc61c19f47c66c0283ee9be980e29ce325a0f4679ef\
             87288ed73ce47fc4f5c79d19ebfa57da7cff3aff6e819e4ee971d86b5e61875d\

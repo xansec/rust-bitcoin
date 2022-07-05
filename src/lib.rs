@@ -32,7 +32,7 @@
 //! * `base64` - (dependency), enables encoding of PSBTs and message signatures.
 //! * `unstable` - enables unstable features for testing.
 //! * `rand` - (dependency), makes it more convenient to generate random values.
-//! * `use-serde` - (dependency), implements `serde`-based serialization and
+//! * `serde` - (dependency), implements `serde`-based serialization and
 //!                 deserialization.
 //! * `secp-lowmemory` - optimizations for low-memory devices.
 //! * `no-std` - enables additional features required for this crate to be usable
@@ -57,7 +57,6 @@
 #![deny(unused_imports)]
 #![deny(missing_docs)]
 #![deny(unused_must_use)]
-#![deny(broken_intra_doc_links)]
 
 #[cfg(not(any(feature = "std", feature = "no-std")))]
 compile_error!("at least one of the `std` or `no-std` features must be enabled");
@@ -90,14 +89,11 @@ extern crate hashbrown;
 pub extern crate base64;
 
 #[cfg(feature="bitcoinconsensus")] extern crate bitcoinconsensus;
-#[cfg(feature = "serde")] #[macro_use] extern crate serde;
+#[cfg(feature = "serde")] #[macro_use] extern crate actual_serde as serde;
 #[cfg(all(test, feature = "serde"))] extern crate serde_json;
 #[cfg(all(test, feature = "serde"))] extern crate serde_test;
 #[cfg(all(test, feature = "serde"))] extern crate bincode;
 #[cfg(all(test, feature = "unstable"))] extern crate test;
-
-#[cfg(target_pointer_width = "16")]
-compile_error!("rust-bitcoin cannot be used on 16-bit architectures");
 
 #[cfg(test)]
 #[macro_use]

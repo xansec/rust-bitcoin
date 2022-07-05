@@ -106,15 +106,15 @@ pub enum RejectReason {
 }
 
 impl Encodable for RejectReason {
-    fn consensus_encode<W: io::Write>(&self, mut e: W) -> Result<usize, io::Error> {
-        e.write_all(&[*self as u8])?;
+    fn consensus_encode<W: io::Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
+        w.write_all(&[*self as u8])?;
         Ok(1)
     }
 }
 
 impl Decodable for RejectReason {
-    fn consensus_decode<D: io::Read>(mut d: D) -> Result<Self, encode::Error> {
-        Ok(match d.read_u8()? {
+    fn consensus_decode<R: io::Read + ?Sized>(r: &mut R) -> Result<Self, encode::Error> {
+        Ok(match r.read_u8()? {
             0x01 => RejectReason::Malformed,
             0x10 => RejectReason::Invalid,
             0x11 => RejectReason::Obsolete,
@@ -170,7 +170,7 @@ mod tests {
         assert_eq!(real_decode.nonce, 16735069437859780935);
         assert_eq!(real_decode.user_agent, "/Satoshi:0.9.99/".to_string());
         assert_eq!(real_decode.start_height, 302892);
-        assert_eq!(real_decode.relay, true);
+        assert!(real_decode.relay);
 
         assert_eq!(serialize(&real_decode), from_sat);
     }

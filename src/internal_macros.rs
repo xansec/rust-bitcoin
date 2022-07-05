@@ -21,24 +21,35 @@ macro_rules! impl_consensus_encoding {
     ($thing:ident, $($field:ident),+) => (
         impl $crate::consensus::Encodable for $thing {
             #[inline]
-            fn consensus_encode<S: $crate::io::Write>(
+            fn consensus_encode<R: $crate::io::Write + ?Sized>(
                 &self,
-                mut s: S,
+                r: &mut R,
             ) -> Result<usize, $crate::io::Error> {
                 let mut len = 0;
-                $(len += self.$field.consensus_encode(&mut s)?;)+
+                $(len += self.$field.consensus_encode(r)?;)+
                 Ok(len)
             }
         }
 
         impl $crate::consensus::Decodable for $thing {
+
             #[inline]
-            fn consensus_decode<D: $crate::io::Read>(
-                d: D,
+            fn consensus_decode_from_finite_reader<R: $crate::io::Read + ?Sized>(
+                r: &mut R,
             ) -> Result<$thing, $crate::consensus::encode::Error> {
-                let mut d = d.take($crate::consensus::encode::MAX_VEC_SIZE as u64);
                 Ok($thing {
-                    $($field: $crate::consensus::Decodable::consensus_decode(&mut d)?),+
+                    $($field: $crate::consensus::Decodable::consensus_decode_from_finite_reader(r)?),+
+                })
+            }
+
+            #[inline]
+            fn consensus_decode<R: $crate::io::Read + ?Sized>(
+                r: &mut R,
+            ) -> Result<$thing, $crate::consensus::encode::Error> {
+                use crate::io::Read as _;
+                let mut r = r.take($crate::consensus::encode::MAX_VEC_SIZE as u64);
+                Ok($thing {
+                    $($field: $crate::consensus::Decodable::consensus_decode(r.by_ref())?),+
                 })
             }
         }
@@ -47,7 +58,7 @@ macro_rules! impl_consensus_encoding {
 
 /// Implements standard array methods for a given wrapper type
 macro_rules! impl_array_newtype {
-    ($thing:ident, $ty:ty, $len:expr) => {
+    ($thing:ident, $ty:ty, $len:literal) => {
         impl $thing {
             /// Converts the object to a raw pointer
             #[inline]
@@ -84,7 +95,7 @@ macro_rules! impl_array_newtype {
             pub fn into_bytes(self) -> [$ty; $len] { self.0 }
         }
 
-        impl<'a> ::core::convert::From<&'a [$ty]> for $thing {
+        impl<'a> core::convert::From<&'a [$ty]> for $thing {
             fn from(data: &'a [$ty]) -> $thing {
                 assert_eq!(data.len(), $len);
                 let mut ret = [0; $len];
@@ -109,7 +120,7 @@ macro_rules! impl_array_newtype {
 
 macro_rules! display_from_debug {
     ($thing:ident) => {
-        impl ::core::fmt::Display for $thing {
+        impl core::fmt::Display for $thing {
             fn fmt(&self, f: &mut ::core::fmt::Formatter) -> Result<(), ::core::fmt::Error> {
                 ::core::fmt::Debug::fmt(self, f)
             }
@@ -127,7 +138,7 @@ macro_rules! hex_hash (($h:ident, $s:expr) => ($h::from_slice(&<$crate::prelude:
 macro_rules! hex_decode (($h:ident, $s:expr) => (deserialize::<$h>(&<$crate::prelude::Vec<u8> as $crate::hashes::hex::FromHex>::from_hex($s).unwrap()).unwrap()));
 
 macro_rules! serde_string_impl {
-    ($name:ident, $expecting:expr) => {
+    ($name:ident, $expecting:literal) => {
         #[cfg(feature = "serde")]
         #[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
         impl<'de> $crate::serde::Deserialize<'de> for $name {
@@ -160,7 +171,7 @@ macro_rules! serde_string_impl {
 
         #[cfg(feature = "serde")]
         #[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
-        impl<'de> $crate::serde::Serialize for $name {
+        impl $crate::serde::Serialize for $name {
             fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
             where
                 S: $crate::serde::Serializer,
@@ -174,7 +185,7 @@ macro_rules! serde_string_impl {
 /// A combination macro where the human-readable serialization is done like
 /// serde_string_impl and the non-human-readable impl is done as a struct.
 macro_rules! serde_struct_human_string_impl {
-    ($name:ident, $expecting:expr, $($fe:ident),*) => (
+    ($name:ident, $expecting:literal, $($fe:ident),*) => (
         #[cfg(feature = "serde")]
         #[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
         impl<'de> $crate::serde::Deserialize<'de> for $name {
@@ -266,7 +277,7 @@ macro_rules! serde_struct_human_string_impl {
                             )*
 
                             let ret = $name {
-                                $($fe: $fe),*
+                                $($fe),*
                             };
 
                             Ok(ret)
@@ -302,7 +313,7 @@ macro_rules! serde_struct_human_string_impl {
                             )*
 
                             let ret = $name {
-                                $($fe: $fe),*
+                                $($fe),*
                             };
 
                             Ok(ret)
@@ -319,7 +330,7 @@ macro_rules! serde_struct_human_string_impl {
 
         #[cfg(feature = "serde")]
         #[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
-        impl<'de> $crate::serde::Serialize for $name {
+        impl $crate::serde::Serialize for $name {
             fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
             where
                 S: $crate::serde::Serializer,
@@ -352,7 +363,7 @@ macro_rules! serde_struct_human_string_impl {
 /// - core::str::FromStr
 /// - hashes::hex::FromHex
 macro_rules! impl_bytes_newtype {
-    ($t:ident, $len:expr) => (
+    ($t:ident, $len:literal) => (
 
         impl ::core::fmt::LowerHex for $t {
             fn fmt(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
@@ -365,13 +376,13 @@ macro_rules! impl_bytes_newtype {
 
         impl ::core::fmt::Display for $t {
             fn fmt(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
-                fmt::LowerHex::fmt(self, f)
+                ::core::fmt::LowerHex::fmt(self, f)
             }
         }
 
         impl ::core::fmt::Debug for $t {
             fn fmt(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
-                fmt::LowerHex::fmt(self, f)
+                ::core::fmt::LowerHex::fmt(self, f)
             }
         }
 
@@ -483,7 +494,7 @@ macro_rules! user_enum {
         $(#[$attr:meta])*
         pub enum $name:ident {
             $(#[$doc:meta]
-              $elem:ident <-> $txt:expr),*
+              $elem:ident <-> $txt:literal),*
         }
     ) => (
         $(#[$attr])*
@@ -563,4 +574,32 @@ macro_rules! user_enum {
             }
         }
     );
+}
+
+/// Formats error. If `std` feature is OFF appends error source (delimited by `: `). We do this
+/// because `e.source()` is only available in std builds, without this macro the error source is
+/// lost for no-std builds.
+macro_rules! write_err {
+    ($writer:expr, $string:literal $(, $args:expr),*; $source:expr) => {
+        {
+            #[cfg(feature = "std")]
+            {
+                let _ = &$source;   // Prevents clippy warnings.
+                write!($writer, $string $(, $args)*)
+            }
+            #[cfg(not(feature = "std"))]
+            {
+                write!($writer, concat!($string, ": {}") $(, $args)*, $source)
+            }
+        }
+    }
+}
+
+/// Asserts a boolean expression at compile time.
+macro_rules! const_assert {
+    ($x:expr) => {
+        {
+            const _: [(); 0 - !$x as usize] = [];
+        }
+    };
 }

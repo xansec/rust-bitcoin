@@ -20,6 +20,7 @@ use crate::prelude::*;
 use crate::io;
 use secp256k1::{self, Secp256k1};
 
+use core::convert::TryFrom;
 use core::fmt;
 use core::cmp::Reverse;
 
@@ -166,6 +167,7 @@ type ScriptMerkleProofMap = BTreeMap<(Script, LeafVersion), BTreeSet<TaprootMerk
 /// [annex](https://github.com/bitcoin/bips/blob/master/bip-0341.mediawiki#cite_note-5).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(crate = "actual_serde"))]
 pub struct TaprootSpendInfo {
     /// The BIP341 internal key.
     internal_key: UntweakedPublicKey,
@@ -217,10 +219,10 @@ impl TaprootSpendInfo {
     ) -> Self {
         let (output_key, parity) = internal_key.tap_tweak(secp, merkle_root);
         Self {
-            internal_key: internal_key,
-            merkle_root: merkle_root,
+            internal_key,
+            merkle_root,
             output_key_parity: parity,
-            output_key: output_key,
+            output_key,
             script_map: BTreeMap::new(),
         }
     }
@@ -314,6 +316,7 @@ impl TaprootSpendInfo {
 // Similar to Taproot Builder in bitcoin core.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(crate = "actual_serde"))]
 pub struct TaprootBuilder {
     // The following doc-comment is from bitcoin core, but modified for Rust. It describes the
     // current state of the builder for a given tree.
@@ -442,14 +445,7 @@ impl TaprootBuilder {
 
     /// Checks if the builder has hidden nodes.
     pub fn has_hidden_nodes(&self) -> bool {
-        for node in &self.branch {
-            if let Some(node) = node {
-                if node.has_hidden_nodes {
-                    return true
-                }
-            }
-        }
-        false
+        self.branch.iter().flatten().any(|node| node.has_hidden_nodes)
     }
 
     /// Creates a [`TaprootSpendInfo`] with the given internal key.
@@ -521,6 +517,12 @@ impl TaprootBuilder {
     }
 }
 
+impl Default for TaprootBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Represents the node information in taproot tree.
 ///
 /// Helper type used in merkle tree construction allowing one to build sparse merkle trees. The node
@@ -531,6 +533,7 @@ impl TaprootBuilder {
 /// root [`NodeInfo`].
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(crate = "actual_serde"))]
 pub struct NodeInfo {
     /// Merkle hash for this node.
     pub(crate) hash: sha256::Hash,
@@ -544,7 +547,7 @@ impl NodeInfo {
     /// Creates a new [`NodeInfo`] with omitted/hidden info.
     pub fn new_hidden_node(hash: sha256::Hash) -> Self {
         Self {
-            hash: hash,
+            hash,
             leaves: vec![],
             has_hidden_nodes: true
         }
@@ -583,6 +586,7 @@ impl NodeInfo {
 /// Store information about taproot leaf node.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(crate = "actual_serde"))]
 pub struct ScriptLeaf {
     /// The underlying script.
     script: Script,
@@ -596,8 +600,8 @@ impl ScriptLeaf {
     /// Creates an new [`ScriptLeaf`] from `script` and `ver` and no merkle branch.
     fn new(script: Script, ver: LeafVersion) -> Self {
         Self {
-            script: script,
-            ver: ver,
+            script,
+            ver,
             merkle_branch: TaprootMerkleBranch(vec![]),
         }
     }
@@ -641,6 +645,7 @@ impl ScriptLeaf {
 // `TapLeafHash`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(crate = "actual_serde"))]
 pub struct TaprootMerkleBranch(Vec<sha256::Hash>);
 
 impl TaprootMerkleBranch {
@@ -668,6 +673,18 @@ impl TaprootMerkleBranch {
         }
     }
 
+    /// Creates a merkle proof from list of hashes.
+    ///
+    /// # Errors
+    /// If inner proof length is more than [`TAPROOT_CONTROL_MAX_NODE_COUNT`] (128).
+    fn from_collection<T: AsRef<[sha256::Hash]> + Into<Vec<sha256::Hash>>>(collection: T) -> Result<Self, TaprootError> {
+        if collection.as_ref().len() > TAPROOT_CONTROL_MAX_NODE_COUNT {
+            Err(TaprootError::InvalidMerkleTreeDepth(collection.as_ref().len()))
+        } else {
+            Ok(TaprootMerkleBranch(collection.into()))
+        }
+    }
+
     /// Serializes to a writer.
     ///
     /// # Returns
@@ -682,7 +699,7 @@ impl TaprootMerkleBranch {
 
     /// Serializes `self` as bytes.
     pub fn serialize(&self) -> Vec<u8> {
-        self.0.iter().map(|e| e.as_inner()).flatten().map(|x| *x).collect::<Vec<u8>>()
+        self.0.iter().flat_map(|e| e.as_inner()).copied().collect::<Vec<u8>>()
     }
 
     /// Appends elements to proof.
@@ -700,12 +717,9 @@ impl TaprootMerkleBranch {
     /// # Errors
     ///
     /// If inner proof length is more than [`TAPROOT_CONTROL_MAX_NODE_COUNT`] (128).
+    #[deprecated(since = "0.29.0", note = "use try_from instead")]
     pub fn from_inner(inner: Vec<sha256::Hash>) -> Result<Self, TaprootError> {
-        if inner.len() > TAPROOT_CONTROL_MAX_NODE_COUNT {
-            Err(TaprootError::InvalidMerkleTreeDepth(inner.len()))
-        } else {
-            Ok(TaprootMerkleBranch(inner))
-        }
+        Self::try_from(inner)
     }
 
     /// Returns the inner list of hashes.
@@ -714,9 +728,29 @@ impl TaprootMerkleBranch {
     }
 }
 
+macro_rules! impl_try_from {
+    ($from:ty) => {
+        impl TryFrom<$from> for TaprootMerkleBranch {
+            type Error = TaprootError;
+
+            /// Creates a merkle proof from list of hashes.
+            ///
+            /// # Errors
+            /// If inner proof length is more than [`TAPROOT_CONTROL_MAX_NODE_COUNT`] (128).
+            fn try_from(v: $from) -> Result<Self, Self::Error> {
+                TaprootMerkleBranch::from_collection(v)
+            }
+        }
+    }
+}
+impl_try_from!(&[sha256::Hash]);
+impl_try_from!(Vec<sha256::Hash>);
+impl_try_from!(Box<[sha256::Hash]>);
+
 /// Control block data structure used in Tapscript satisfaction.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(crate = "actual_serde"))]
 pub struct ControlBlock {
     /// The tapleaf version.
     pub leaf_version: LeafVersion,
@@ -802,7 +836,7 @@ impl ControlBlock {
     ) -> bool {
         // compute the script hash
         // Initially the curr_hash is the leaf hash
-        let leaf_hash = TapLeafHash::from_script(&script, self.leaf_version);
+        let leaf_hash = TapLeafHash::from_script(script, self.leaf_version);
         let mut curr_hash = TapBranchHash::from_inner(leaf_hash.into_inner());
         // Verify the proof
         for elem in self.merkle_branch.as_inner() {
@@ -969,6 +1003,7 @@ impl<'de> ::serde::Deserialize<'de> for LeafVersion {
 
 /// Detailed error type for taproot builder.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
 pub enum TaprootBuilderError {
     /// Merkle tree depth must not be more than 128.
     InvalidMerkleTreeDepth(usize),
@@ -998,8 +1033,8 @@ impl fmt::Display for TaprootBuilderError {
                 "Attempted to create a tree with two nodes at depth 0. There must\
                 only be a exactly one node at depth 0",
             ),
-            TaprootBuilderError::InvalidInternalKey(e) => {
-                write!(f, "Invalid Internal XOnly key : {}", e)
+            TaprootBuilderError::InvalidInternalKey(ref e) => {
+                write_err!(f, "invalid internal x-only key"; e)
             }
             TaprootBuilderError::IncompleteTree => {
                 write!(f, "Called finalize on an incomplete tree")
@@ -1030,6 +1065,7 @@ impl std::error::Error for TaprootBuilderError {
 
 /// Detailed error type for taproot utilities.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
 pub enum TaprootError {
     /// Proof size must be a multiple of 32.
     InvalidMerkleBranchSize(usize),
@@ -1070,9 +1106,8 @@ impl fmt::Display for TaprootError {
                 "Control Block size({}) must be of the form 33 + 32*m where  0 <= m <= {} ",
                 sz, TAPROOT_CONTROL_MAX_NODE_COUNT
             ),
-            // TODO: add source when in MSRV
-            TaprootError::InvalidInternalKey(e) => write!(f, "Invalid Internal XOnly key : {}", e),
-            TaprootError::InvalidParity(e) => write!(f, "Invalid parity value for internal key: {}", e),
+            TaprootError::InvalidInternalKey(ref e) => write_err!(f, "invalid internal x-only key"; e),
+            TaprootError::InvalidParity(_) => write!(f, "invalid parity value for internal key"),
             TaprootError::EmptyTree => write!(f, "Taproot Tree must contain at least one script"),
         }
     }
@@ -1256,9 +1291,9 @@ mod test {
          *   3            55 51
          */
 
-        for (script, length) in vec![("51", 3), ("52", 2), ("53", 2), ("54", 2), ("55", 3)] {
+        for (script, length) in [("51", 3), ("52", 2), ("53", 2), ("54", 2), ("55", 3)].iter() {
             assert_eq!(
-                length,
+                *length,
                 tree_info
                     .script_map
                     .get(&(Script::from_hex(script).unwrap(), LeafVersion::TapScript))
@@ -1355,12 +1390,12 @@ mod test {
             if script_tree.is_null() {
                 assert!(arr["intermediary"]["merkleRoot"].is_null());
             } else {
-                merkle_root = Some(TapBranchHash::from_str(&arr["intermediary"]["merkleRoot"].as_str().unwrap()).unwrap());
+                merkle_root = Some(TapBranchHash::from_str(arr["intermediary"]["merkleRoot"].as_str().unwrap()).unwrap());
                 let leaf_hashes = arr["intermediary"]["leafHashes"].as_array().unwrap();
                 let ctrl_blks = arr["expected"]["scriptPathControlBlocks"].as_array().unwrap();
                 let mut builder = TaprootBuilder::new();
                 let mut leaves = vec![];
-                builder = process_script_trees(&script_tree, builder, &mut leaves, 0);
+                builder = process_script_trees(script_tree, builder, &mut leaves, 0);
                 let spend_info = builder.finalize(secp, internal_key).unwrap();
                 for (i, script_ver) in leaves.iter().enumerate() {
                     let expected_leaf_hash = leaf_hashes[i].as_str().unwrap();
@@ -1378,8 +1413,8 @@ mod test {
             let expected_addr = Address::from_str(arr["expected"]["bip350Address"].as_str().unwrap()).unwrap();
 
             let tweak = TapTweakHash::from_key_and_tweak(internal_key, merkle_root);
-            let (output_key, _parity) = internal_key.tap_tweak(&secp, merkle_root);
-            let addr = Address::p2tr(&secp, internal_key, merkle_root, Network::Bitcoin);
+            let (output_key, _parity) = internal_key.tap_tweak(secp, merkle_root);
+            let addr = Address::p2tr(secp, internal_key, merkle_root, Network::Bitcoin);
             let spk = addr.script_pubkey();
 
             assert_eq!(expected_output_key, output_key.to_inner());

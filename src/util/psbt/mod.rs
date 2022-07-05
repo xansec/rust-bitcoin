@@ -24,7 +24,6 @@ use core::cmp;
 use crate::blockdata::script::Script;
 use crate::blockdata::transaction::{ TxOut, Transaction};
 use crate::consensus::{encode, Encodable, Decodable};
-use crate::consensus::encode::MAX_VEC_SIZE;
 pub use crate::util::sighash::Prevouts;
 
 use crate::prelude::*;
@@ -52,6 +51,7 @@ pub type Psbt = PartiallySignedTransaction;
 /// A Partially Signed Transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(crate = "actual_serde"))]
 pub struct PartiallySignedTransaction {
     /// The unsigned transaction, scriptSigs and witnesses for each input must be empty.
     pub unsigned_tx: Transaction,
@@ -223,6 +223,7 @@ mod display_from_str {
     /// Error encountered during PSBT decoding from Base64 string.
     #[derive(Debug)]
     #[cfg_attr(docsrs, doc(cfg(feature = "base64")))]
+    #[non_exhaustive]
     pub enum PsbtParseError {
         /// Error in internal PSBT data structure.
         PsbtEncoding(Error),
@@ -232,9 +233,11 @@ mod display_from_str {
 
     impl Display for PsbtParseError {
         fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-            match self {
-                PsbtParseError::PsbtEncoding(err) => Display::fmt(err, f),
-                PsbtParseError::Base64Encoding(err) => Display::fmt(err, f),
+            use self::PsbtParseError::*;
+
+            match *self {
+                PsbtEncoding(ref e) => write_err!(f, "error in internal PSBT data structure"; e),
+                Base64Encoding(ref e) => write_err!(f, "error in PSBT base64 encoding"; e),
             }
         }
     }
@@ -265,7 +268,7 @@ mod display_from_str {
 
         fn from_str(s: &str) -> Result<Self, Self::Err> {
             let data = ::base64::decode(s).map_err(PsbtParseError::Base64Encoding)?;
-            Ok(encode::deserialize(&data).map_err(PsbtParseError::PsbtEncoding)?)
+            encode::deserialize(&data).map_err(PsbtParseError::PsbtEncoding)
         }
     }
 }
@@ -274,20 +277,20 @@ mod display_from_str {
 pub use self::display_from_str::PsbtParseError;
 
 impl Encodable for PartiallySignedTransaction {
-    fn consensus_encode<S: io::Write>(&self, mut s: S) -> Result<usize, io::Error> {
+    fn consensus_encode<W: io::Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
         let mut len = 0;
-        len += b"psbt".consensus_encode(&mut s)?;
+        len += b"psbt".consensus_encode(w)?;
 
-        len += 0xff_u8.consensus_encode(&mut s)?;
+        len += 0xff_u8.consensus_encode(w)?;
 
-        len += self.consensus_encode_map(&mut s)?;
+        len += self.consensus_encode_map(w)?;
 
         for i in &self.inputs {
-            len += i.consensus_encode(&mut s)?;
+            len += i.consensus_encode(w)?;
         }
 
         for i in &self.outputs {
-            len += i.consensus_encode(&mut s)?;
+            len += i.consensus_encode(w)?;
         }
 
         Ok(len)
@@ -295,19 +298,18 @@ impl Encodable for PartiallySignedTransaction {
 }
 
 impl Decodable for PartiallySignedTransaction {
-    fn consensus_decode<D: io::Read>(d: D) -> Result<Self, encode::Error> {
-        let mut d = d.take(MAX_VEC_SIZE as u64);
-        let magic: [u8; 4] = Decodable::consensus_decode(&mut d)?;
+    fn consensus_decode_from_finite_reader<R: io::Read + ?Sized>(r: &mut R) -> Result<Self, encode::Error> {
+        let magic: [u8; 4] = Decodable::consensus_decode(r)?;
 
         if *b"psbt" != magic {
             return Err(Error::InvalidMagic.into());
         }
 
-        if 0xff_u8 != u8::consensus_decode(&mut d)? {
+        if 0xff_u8 != u8::consensus_decode(r)? {
             return Err(Error::InvalidSeparator.into());
         }
 
-        let mut global = PartiallySignedTransaction::consensus_decode_global(&mut d)?;
+        let mut global = PartiallySignedTransaction::consensus_decode_global(r)?;
         global.unsigned_tx_checks()?;
 
         let inputs: Vec<Input> = {
@@ -316,7 +318,7 @@ impl Decodable for PartiallySignedTransaction {
             let mut inputs: Vec<Input> = Vec::with_capacity(inputs_len);
 
             for _ in 0..inputs_len {
-                inputs.push(Decodable::consensus_decode(&mut d)?);
+                inputs.push(Decodable::consensus_decode(r)?);
             }
 
             inputs
@@ -328,7 +330,7 @@ impl Decodable for PartiallySignedTransaction {
             let mut outputs: Vec<Output> = Vec::with_capacity(outputs_len);
 
             for _ in 0..outputs_len {
-                outputs.push(Decodable::consensus_decode(&mut d)?);
+                outputs.push(Decodable::consensus_decode(r)?);
             }
 
             outputs
@@ -354,7 +356,7 @@ mod tests {
     use crate::blockdata::transaction::{Transaction, TxIn, TxOut, OutPoint};
     use crate::network::constants::Network::Bitcoin;
     use crate::consensus::encode::{deserialize, serialize, serialize_hex};
-    use crate::util::bip32::{ChildNumber, ExtendedPrivKey, ExtendedPubKey, Fingerprint, KeySource};
+    use crate::util::bip32::{ChildNumber, ExtendedPrivKey, ExtendedPubKey, KeySource};
     use crate::util::psbt::map::{Output, Input};
     use crate::util::psbt::raw;
 
@@ -400,7 +402,7 @@ mod tests {
 
         let mut sk: ExtendedPrivKey = ExtendedPrivKey::new_master(Bitcoin, &seed).unwrap();
 
-        let fprint: Fingerprint = sk.fingerprint(&secp);
+        let fprint = sk.fingerprint(secp);
 
         let dpath: Vec<ChildNumber> = vec![
             ChildNumber::from_normal_idx(0).unwrap(),
@@ -415,7 +417,7 @@ mod tests {
 
         sk = sk.derive_priv(secp, &dpath).unwrap();
 
-        let pk: ExtendedPubKey = ExtendedPubKey::from_priv(&secp, &sk);
+        let pk = ExtendedPubKey::from_priv(secp, &sk);
 
         hd_keypaths.insert(pk.public_key, (fprint, dpath.into()));
 
@@ -799,7 +801,7 @@ mod tests {
 
             assert!(&psbt.inputs[0].final_script_sig.is_some());
 
-            let redeem_script: &Script = &psbt.inputs[1].redeem_script.as_ref().unwrap();
+            let redeem_script = psbt.inputs[1].redeem_script.as_ref().unwrap();
             let expected_out = hex_script!("a9143545e6e33b832c47050f24d3eeb93c9c03948bc787");
 
             assert!(redeem_script.is_v0_p2wpkh());
@@ -845,7 +847,7 @@ mod tests {
             assert!(&psbt.inputs[0].final_script_sig.is_none());
             assert!(&psbt.inputs[1].final_script_sig.is_none());
 
-            let redeem_script: &Script = &psbt.inputs[1].redeem_script.as_ref().unwrap();
+            let redeem_script = psbt.inputs[1].redeem_script.as_ref().unwrap();
             let expected_out = hex_script!("a9143545e6e33b832c47050f24d3eeb93c9c03948bc787");
 
             assert!(redeem_script.is_v0_p2wpkh());
@@ -856,7 +858,7 @@ mod tests {
             assert_eq!(redeem_script.to_p2sh(), expected_out);
 
             for output in psbt.outputs {
-                assert!(output.get_pairs().unwrap().len() > 0)
+                assert!(!output.get_pairs().unwrap().is_empty())
             }
         }
 
@@ -869,7 +871,7 @@ mod tests {
 
             assert!(&psbt.inputs[0].final_script_sig.is_none());
 
-            let redeem_script: &Script = &psbt.inputs[0].redeem_script.as_ref().unwrap();
+            let redeem_script = psbt.inputs[0].redeem_script.as_ref().unwrap();
             let expected_out = hex_script!("a9146345200f68d189e1adc0df1c4d16ea8f14c0dbeb87");
 
             assert!(redeem_script.is_v0_p2wsh());
@@ -924,7 +926,10 @@ mod tests {
             let err = hex_psbt!("70736274ff01007d020000000127744ababf3027fe0d6cf23a96eee2efb188ef52301954585883e69b6624b2420000000000ffffffff02887b0100000000001600142382871c7e8421a00093f754d91281e675874b9f606b042a010000002251205a2c2cf5b52cf31f83ad2e8da63ff03183ecd8f609c7510ae8a48e03910a0757000000000001012b00f2052a010000002251205a2c2cf5b52cf31f83ad2e8da63ff03183ecd8f609c7510ae8a48e03910a07570000220702fe349064c98d6e2a853fa3c9b12bd8b304a19c195c60efa7ee2393046d3fa2321900772b2da7560000800100008000000080010000000000000000").unwrap_err();
             assert_eq!(err.to_string(), "parse failed: Invalid xonly public key");
             let err = hex_psbt!("70736274ff01005e02000000019bd48765230bf9a72e662001f972556e54f0c6f97feb56bcb5600d817f6995260100000000ffffffff0148e6052a01000000225120030da4fce4f7db28c2cb2951631e003713856597fe963882cb500e68112cca63000000000001012b00f2052a01000000225120c2247efbfd92ac47f6f40b8d42d169175a19fa9fa10e4a25d7f35eb4dd85b6924214022cb13ac68248de806aa6a3659cf3c03eb6821d09c8114a4e868febde865bb6d2cd970e15f53fc0c82f950fd560ffa919b76172be017368a89913af074f400b094089756aa3739ccc689ec0fcf3a360be32cc0b59b16e93a1e8bb4605726b2ca7a3ff706c4176649632b2cc68e1f912b8a578e3719ce7710885c7a966f49bcd43cb0000").unwrap_err();
-            assert_eq!(err.to_string(), "PSBT error: Hash Parse Error: bad slice length 33 (expected 32)");
+            #[cfg(feature = "std")]
+            assert_eq!(err.to_string(), "PSBT error");
+            #[cfg(not(feature = "std"))]
+            assert_eq!(err.to_string(), "PSBT error: hash parse error: bad slice length 33 (expected 32)");
             let err = hex_psbt!("70736274ff01005e02000000019bd48765230bf9a72e662001f972556e54f0c6f97feb56bcb5600d817f6995260100000000ffffffff0148e6052a01000000225120030da4fce4f7db28c2cb2951631e003713856597fe963882cb500e68112cca63000000000001012b00f2052a01000000225120c2247efbfd92ac47f6f40b8d42d169175a19fa9fa10e4a25d7f35eb4dd85b69241142cb13ac68248de806aa6a3659cf3c03eb6821d09c8114a4e868febde865bb6d2cd970e15f53fc0c82f950fd560ffa919b76172be017368a89913af074f400b094289756aa3739ccc689ec0fcf3a360be32cc0b59b16e93a1e8bb4605726b2ca7a3ff706c4176649632b2cc68e1f912b8a578e3719ce7710885c7a966f49bcd43cb01010000").unwrap_err();
             assert_eq!(err.to_string(), "parse failed: Invalid Schnorr signature length");
             let err = hex_psbt!("70736274ff01005e02000000019bd48765230bf9a72e662001f972556e54f0c6f97feb56bcb5600d817f6995260100000000ffffffff0148e6052a01000000225120030da4fce4f7db28c2cb2951631e003713856597fe963882cb500e68112cca63000000000001012b00f2052a01000000225120c2247efbfd92ac47f6f40b8d42d169175a19fa9fa10e4a25d7f35eb4dd85b69241142cb13ac68248de806aa6a3659cf3c03eb6821d09c8114a4e868febde865bb6d2cd970e15f53fc0c82f950fd560ffa919b76172be017368a89913af074f400b093989756aa3739ccc689ec0fcf3a360be32cc0b59b16e93a1e8bb4605726b2ca7a3ff706c4176649632b2cc68e1f912b8a578e3719ce7710885c7a966f49bcd43cb0000").unwrap_err();

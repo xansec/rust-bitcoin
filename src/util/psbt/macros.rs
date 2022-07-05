@@ -55,11 +55,11 @@ macro_rules! impl_psbt_serialize {
 macro_rules! impl_psbtmap_consensus_encoding {
     ($thing:ty) => {
         impl $crate::consensus::Encodable for $thing {
-            fn consensus_encode<S: $crate::io::Write>(
+            fn consensus_encode<W: $crate::io::Write + ?Sized>(
                 &self,
-                s: S,
+                w: &mut W,
             ) -> Result<usize, $crate::io::Error> {
-                self.consensus_encode_map(s)
+                self.consensus_encode_map(w)
             }
         }
     };
@@ -68,13 +68,13 @@ macro_rules! impl_psbtmap_consensus_encoding {
 macro_rules! impl_psbtmap_consensus_decoding {
     ($thing:ty) => {
         impl $crate::consensus::Decodable for $thing {
-            fn consensus_decode<D: $crate::io::Read>(
-                mut d: D,
+            fn consensus_decode<R: $crate::io::Read + ?Sized>(
+                r: &mut R,
             ) -> Result<Self, $crate::consensus::encode::Error> {
                 let mut rv: Self = ::core::default::Default::default();
 
                 loop {
-                    match $crate::consensus::Decodable::consensus_decode(&mut d) {
+                    match $crate::consensus::Decodable::consensus_decode(r) {
                         Ok(pair) => rv.insert_pair(pair)?,
                         Err($crate::consensus::encode::Error::Psbt($crate::util::psbt::Error::NoMorePairs)) => return Ok(rv),
                         Err(e) => return Err(e),
@@ -92,7 +92,7 @@ macro_rules! impl_psbtmap_consensus_enc_dec_oding {
     };
 }
 
-#[cfg_attr(rustfmt, rustfmt_skip)]
+#[rustfmt::skip]
 macro_rules! impl_psbt_insert_pair {
     ($slf:ident.$unkeyed_name:ident <= <$raw_key:ident: _>|<$raw_value:ident: $unkeyed_value_type:ty>) => {
         if $raw_key.key.is_empty() {
@@ -122,8 +122,7 @@ macro_rules! impl_psbt_insert_pair {
     };
 }
 
-
-#[cfg_attr(rustfmt, rustfmt_skip)]
+#[rustfmt::skip]
 macro_rules! impl_psbt_get_pair {
     ($rv:ident.push($slf:ident.$unkeyed_name:ident, $unkeyed_typeval:ident)) => {
         if let Some(ref $unkeyed_name) = $slf.$unkeyed_name {
