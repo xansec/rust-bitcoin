@@ -142,6 +142,7 @@ pub struct Reject {
     pub hash: sha256d::Hash
 }
 
+
 impl_consensus_encoding!(Reject, message, ccode, reason, hash);
 
 #[cfg(test)]
@@ -152,15 +153,21 @@ mod tests {
     use network::constants::ServiceFlags;
 
     use consensus::encode::{deserialize, serialize};
+    
+    fn print_type_of<T>(_: &T) {
+       println!("{}", std::any::type_name::<T>())
+    }
 
     #[test]
     fn version_message_test() {
         // This message is from my satoshi node, morning of May 27 2014
         let from_sat = Vec::from_hex("721101000100000000000000e6e0845300000000010000000000000000000000000000000000ffff0000000000000100000000000000fd87d87eeb4364f22cf54dca59412db7208d47d920cffce83ee8102f5361746f7368693a302e392e39392f2c9f040001").unwrap();
-
+        //print!("Encoded message: ");
+        //println!("{:#?}", from_sat);
+        print_type_of(&from_sat);
         let decode: Result<VersionMessage, _> = deserialize(&from_sat);
         assert!(decode.is_ok());
-        let real_decode = decode.unwrap();
+        let real_decode = decode.as_ref().unwrap();
         assert_eq!(real_decode.version, 70002);
         assert_eq!(real_decode.services, ServiceFlags::NETWORK);
         assert_eq!(real_decode.timestamp, 1401217254);
@@ -169,6 +176,9 @@ mod tests {
         assert_eq!(real_decode.user_agent, "/Satoshi:0.9.99/".to_string());
         assert_eq!(real_decode.start_height, 302892);
         assert_eq!(real_decode.relay, true);
+        //print!("Decoded message: ");
+        //println!("{:#?}", decode);
+        //println!("{:#?}", real_decode);
 
         assert_eq!(serialize(&real_decode), from_sat);
     }
