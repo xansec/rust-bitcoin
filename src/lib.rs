@@ -32,7 +32,7 @@
 //! * `base64` - (dependency), enables encoding of PSBTs and message signatures.
 //! * `unstable` - enables unstable features for testing.
 //! * `rand` - (dependency), makes it more convenient to generate random values.
-//! * `use-serde` - (dependency), implements `serde`-based serialization and
+//! * `serde` - (dependency), implements `serde`-based serialization and
 //!                 deserialization.
 //! * `secp-lowmemory` - optimizations for low-memory devices.
 //! * `no-std` - enables additional features required for this crate to be usable
@@ -57,7 +57,6 @@
 #![deny(unused_imports)]
 #![deny(missing_docs)]
 #![deny(unused_must_use)]
-#![deny(broken_intra_doc_links)]
 
 #[cfg(not(any(feature = "std", feature = "no-std")))]
 compile_error!("at least one of the `std` or `no-std` features must be enabled");
@@ -90,14 +89,11 @@ extern crate hashbrown;
 pub extern crate base64;
 
 #[cfg(feature="bitcoinconsensus")] extern crate bitcoinconsensus;
-#[cfg(feature = "serde")] #[macro_use] extern crate serde;
+#[cfg(feature = "serde")] #[macro_use] extern crate actual_serde as serde;
 #[cfg(all(test, feature = "serde"))] extern crate serde_json;
 #[cfg(all(test, feature = "serde"))] extern crate serde_test;
 #[cfg(all(test, feature = "serde"))] extern crate bincode;
 #[cfg(all(test, feature = "unstable"))] extern crate test;
-
-#[cfg(target_pointer_width = "16")]
-compile_error!("rust-bitcoin cannot be used on 16-bit architectures");
 
 #[cfg(test)]
 #[macro_use]
@@ -115,31 +111,33 @@ pub mod consensus;
 pub mod hash_types;
 pub mod policy;
 
-pub use hash_types::*;
-pub use blockdata::block::Block;
-pub use blockdata::block::BlockHeader;
-pub use blockdata::script::Script;
-pub use blockdata::transaction::Transaction;
-pub use blockdata::transaction::TxIn;
-pub use blockdata::transaction::TxOut;
-pub use blockdata::transaction::OutPoint;
-pub use blockdata::transaction::SigHashType;
-pub use consensus::encode::VarInt;
-pub use network::constants::Network;
-pub use util::Error;
-pub use util::address::Address;
-pub use util::address::AddressType;
-pub use util::amount::Amount;
-pub use util::amount::Denomination;
-pub use util::amount::SignedAmount;
-pub use util::merkleblock::MerkleBlock;
+pub use crate::hash_types::*;
+pub use crate::blockdata::block::Block;
+pub use crate::blockdata::block::BlockHeader;
+pub use crate::blockdata::script::Script;
+pub use crate::blockdata::transaction::Transaction;
+pub use crate::blockdata::transaction::TxIn;
+pub use crate::blockdata::transaction::TxOut;
+pub use crate::blockdata::transaction::OutPoint;
+pub use crate::blockdata::transaction::EcdsaSighashType;
+pub use crate::blockdata::witness::Witness;
+pub use crate::consensus::encode::VarInt;
+pub use crate::network::constants::Network;
+pub use crate::util::Error;
+pub use crate::util::address::Address;
+pub use crate::util::address::AddressType;
+pub use crate::util::amount::Amount;
+pub use crate::util::amount::Denomination;
+pub use crate::util::amount::SignedAmount;
+pub use crate::util::merkleblock::MerkleBlock;
+pub use crate::util::sighash::SchnorrSighashType;
 
-pub use util::ecdsa;
-pub use util::schnorr;
-#[deprecated(since = "0.26.1", note = "Please use `ecdsa::PrivateKey` instead")]
-pub use util::ecdsa::PrivateKey;
-#[deprecated(since = "0.26.1", note = "Please use `ecdsa::PublicKey` instead")]
-pub use util::ecdsa::PublicKey;
+pub use crate::util::ecdsa::{self, EcdsaSig, EcdsaSigError};
+pub use crate::util::schnorr::{self, SchnorrSig, SchnorrSigError};
+pub use crate::util::key::{PrivateKey, PublicKey, XOnlyPublicKey, KeyPair};
+pub use crate::util::psbt;
+#[allow(deprecated)]
+pub use crate::blockdata::transaction::SigHashType;
 
 #[cfg(feature = "std")]
 use std::io;
@@ -188,7 +186,7 @@ mod prelude {
     pub use std::io::sink;
 
     #[cfg(not(feature = "std"))]
-    pub use io_extras::sink;
+    pub use crate::io_extras::sink;
 
     #[cfg(feature = "hashbrown")]
     pub use hashbrown::HashSet;
@@ -202,7 +200,7 @@ mod prelude {
 #[cfg(all(test, feature = "unstable"))]
 mod tests {
     use core::fmt::Arguments;
-    use io::{IoSlice, Result, Write};
+    use crate::io::{IoSlice, Result, Write};
 
     #[derive(Default, Clone, Debug, PartialEq, Eq)]
     pub struct EmptyWrite;

@@ -39,8 +39,8 @@
 
 use core::{fmt, ops, convert::From};
 
-use io;
-use consensus::encode::{self, Encodable, Decodable};
+use crate::io;
+use crate::consensus::encode::{self, Encodable, Decodable};
 
 /// Version of the protocol as appearing in network message headers
 /// This constant is used to signal to other peers which features you support.
@@ -144,7 +144,7 @@ impl ServiceFlags {
     /// WITNESS indicates that a node can be asked for blocks and transactions including witness
     /// data.
     pub const WITNESS: ServiceFlags = ServiceFlags(1 << 3);
-    
+
     /// COMPACT_FILTERS means the node will service basic block filter requests.
     /// See BIP157 and BIP158 for details on how this is implemented.
     pub const COMPACT_FILTERS: ServiceFlags = ServiceFlags(1 << 6);
@@ -178,7 +178,13 @@ impl ServiceFlags {
     }
 
     /// Get the integer representation of this [ServiceFlags].
+    #[deprecated(since = "0.29.0", note = "use to_u64 instead")]
     pub fn as_u64(self) -> u64 {
+        self.to_u64()
+    }
+
+    /// Gets the integer representation of this [`ServiceFlags`].
+    pub fn to_u64(self) -> u64 {
         self.0
     }
 }
@@ -238,9 +244,9 @@ impl From<u64> for ServiceFlags {
     }
 }
 
-impl Into<u64> for ServiceFlags {
-    fn into(self) -> u64 {
-        self.0
+impl From<ServiceFlags> for u64 {
+    fn from(flags: ServiceFlags) -> Self {
+        flags.0
     }
 }
 
@@ -274,61 +280,35 @@ impl ops::BitXorAssign for ServiceFlags {
 
 impl Encodable for ServiceFlags {
     #[inline]
-    fn consensus_encode<S: io::Write>(
-        &self,
-        mut s: S,
-    ) -> Result<usize, io::Error> {
-        self.0.consensus_encode(&mut s)
+    fn consensus_encode<W: io::Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
+        self.0.consensus_encode(w)
     }
 }
 
 impl Decodable for ServiceFlags {
     #[inline]
-    fn consensus_decode<D: io::Read>(mut d: D) -> Result<Self, encode::Error> {
-        Ok(ServiceFlags(Decodable::consensus_decode(&mut d)?))
+    fn consensus_decode<R: io::Read + ?Sized>(r: &mut R) -> Result<Self, encode::Error> {
+        Ok(ServiceFlags(Decodable::consensus_decode(r)?))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{Network, ServiceFlags};
-    use consensus::encode::{deserialize, serialize};
+    use crate::consensus::encode::{deserialize, serialize};
 
     #[test]
     fn serialize_test() {
-        assert_eq!(
-            serialize(&Network::Bitcoin.magic()),
-            &[0xf9, 0xbe, 0xb4, 0xd9]
-        );
-        assert_eq!(
-            serialize(&Network::Testnet.magic()),
-            &[0x0b, 0x11, 0x09, 0x07]
-        );
-        assert_eq!(
-            serialize(&Network::Signet.magic()),
-            &[0x0a, 0x03, 0xcf, 0x40]
-        );
-        assert_eq!(
-            serialize(&Network::Regtest.magic()),
-            &[0xfa, 0xbf, 0xb5, 0xda]
-        );
+        assert_eq!(serialize(&Network::Bitcoin.magic()), &[0xf9, 0xbe, 0xb4, 0xd9]);
+        assert_eq!(serialize(&Network::Testnet.magic()), &[0x0b, 0x11, 0x09, 0x07]);
+        assert_eq!(serialize(&Network::Signet.magic()), &[0x0a, 0x03, 0xcf, 0x40]);
+        assert_eq!(serialize(&Network::Regtest.magic()), &[0xfa, 0xbf, 0xb5, 0xda]);
 
-        assert_eq!(
-            deserialize(&[0xf9, 0xbe, 0xb4, 0xd9]).ok(),
-            Some(Network::Bitcoin.magic())
-        );
-        assert_eq!(
-            deserialize(&[0x0b, 0x11, 0x09, 0x07]).ok(),
-            Some(Network::Testnet.magic())
-        );
-        assert_eq!(
-            deserialize(&[0x0a, 0x03, 0xcf, 0x40]).ok(),
-            Some(Network::Signet.magic())
-        );
-        assert_eq!(
-            deserialize(&[0xfa, 0xbf, 0xb5, 0xda]).ok(),
-            Some(Network::Regtest.magic())
-        );
+        assert_eq!(deserialize(&[0xf9, 0xbe, 0xb4, 0xd9]).ok(), Some(Network::Bitcoin.magic()));
+        assert_eq!(deserialize(&[0x0b, 0x11, 0x09, 0x07]).ok(), Some(Network::Testnet.magic()));
+        assert_eq!(deserialize(&[0x0a, 0x03, 0xcf, 0x40]).ok(), Some(Network::Signet.magic()));
+        assert_eq!(deserialize(&[0xfa, 0xbf, 0xb5, 0xda]).ok(), Some(Network::Regtest.magic()));
+
     }
 
     #[test]
@@ -371,7 +351,7 @@ mod tests {
 
         flags2 ^= ServiceFlags::WITNESS;
         assert_eq!(flags2, ServiceFlags::GETUTXO);
-        
+
         flags2 |= ServiceFlags::COMPACT_FILTERS;
         flags2 ^= ServiceFlags::GETUTXO;
         assert_eq!(flags2, ServiceFlags::COMPACT_FILTERS);
@@ -385,4 +365,3 @@ mod tests {
         assert_eq!("ServiceFlags(WITNESS|COMPACT_FILTERS|0xb0)", flag.to_string());
     }
 }
-

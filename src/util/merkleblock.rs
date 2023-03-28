@@ -52,18 +52,18 @@
 //! assert_eq!(1, index[0]);
 //! ```
 
-use prelude::*;
+use crate::prelude::*;
 
-use io;
+use crate::io;
 
-use hashes::Hash;
-use hash_types::{Txid, TxMerkleNode};
+use crate::hashes::Hash;
+use crate::hash_types::{Txid, TxMerkleNode};
 
-use blockdata::transaction::Transaction;
-use blockdata::constants::{MAX_BLOCK_WEIGHT, MIN_TRANSACTION_WEIGHT};
-use consensus::encode::{self, Decodable, Encodable};
-use util::merkleblock::MerkleBlockError::*;
-use {Block, BlockHeader};
+use crate::blockdata::transaction::Transaction;
+use crate::blockdata::constants::{MAX_BLOCK_WEIGHT, MIN_TRANSACTION_WEIGHT};
+use crate::consensus::encode::{self, Decodable, Encodable};
+use crate::util::merkleblock::MerkleBlockError::*;
+use crate::{Block, BlockHeader};
 
 /// An error when verifying the merkle block
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -122,6 +122,21 @@ pub struct PartialMerkleTree {
 }
 
 impl PartialMerkleTree {
+    /// Returns the total number of transactions in the block.
+    pub fn num_transactions(&self) -> u32 {
+        self.num_transactions
+    }
+
+    /// Returns the node-is-parent-of-matched-txid bits of the partial merkle tree.
+    pub fn bits(&self) -> &Vec<bool> {
+        &self.bits
+    }
+
+    /// Returns the transaction ids and internal hashes of the partial merkle tree.
+    pub fn hashes(&self) -> &Vec<TxMerkleNode> {
+        &self.hashes
+    }
+
     /// Construct a partial merkle tree
     /// The `txids` are the transaction hashes of the block and the `matches` is the contains flags
     /// wherever a tx hash should be included in the proof.
@@ -189,9 +204,7 @@ impl PartialMerkleTree {
         }
         // there can never be more hashes provided than one for every txid
         if self.hashes.len() as u32 > self.num_transactions {
-            return Err(BadFormat(
-                "Proof contains more hashes than transactions".to_owned(),
-            ));
+            return Err(BadFormat("Proof contains more hashes than transactions".to_owned()));
         };
         // there must be at least one bit per node in the partial tree, and at least one node per hash
         if self.bits.len() < self.hashes.len() {
@@ -246,13 +259,7 @@ impl PartialMerkleTree {
     }
 
     /// Recursive function that traverses tree nodes, storing the data as bits and hashes
-    fn traverse_and_build(
-        &mut self,
-        height: u32,
-        pos: u32,
-        txids: &[Txid],
-        matches: &[bool],
-    ) {
+    fn traverse_and_build(&mut self, height: u32, pos: u32, txids: &[Txid], matches: &[bool]) {
         // Determine whether this node is the parent of at least one matched txid
         let mut parent_of_match = false;
         let mut p = pos << height;
@@ -348,26 +355,23 @@ impl PartialMerkleTree {
 }
 
 impl Encodable for PartialMerkleTree {
-    fn consensus_encode<S: io::Write>(
-        &self,
-        mut s: S,
-    ) -> Result<usize, io::Error> {
-        let ret = self.num_transactions.consensus_encode(&mut s)?
-            + self.hashes.consensus_encode(&mut s)?;
+    fn consensus_encode<W: io::Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
+        let ret = self.num_transactions.consensus_encode(w)?
+            + self.hashes.consensus_encode(w)?;
         let mut bytes: Vec<u8> = vec![0; (self.bits.len() + 7) / 8];
         for p in 0..self.bits.len() {
             bytes[p / 8] |= (self.bits[p] as u8) << (p % 8) as u8;
         }
-        Ok(ret + bytes.consensus_encode(s)?)
+        Ok(ret + bytes.consensus_encode(w)?)
     }
 }
 
 impl Decodable for PartialMerkleTree {
-    fn consensus_decode<D: io::Read>(mut d: D) -> Result<Self, encode::Error> {
-        let num_transactions: u32 = Decodable::consensus_decode(&mut d)?;
-        let hashes: Vec<TxMerkleNode> = Decodable::consensus_decode(&mut d)?;
+    fn consensus_decode<R: io::Read + ?Sized>(r: &mut R) -> Result<Self, encode::Error> {
+        let num_transactions: u32 = Decodable::consensus_decode(r)?;
+        let hashes: Vec<TxMerkleNode> = Decodable::consensus_decode(r)?;
 
-        let bytes: Vec<u8> = Decodable::consensus_decode(d)?;
+        let bytes: Vec<u8> = Decodable::consensus_decode(r)?;
         let mut bits: Vec<bool> = vec![false; bytes.len() * 8];
 
         for (p, bit) in bits.iter_mut().enumerate() {
@@ -432,7 +436,9 @@ impl MerkleBlock {
     /// assert_eq!(txid, matches[0]);
     /// ```
     pub fn from_block_with_predicate<F>(block: &Block, match_txids: F) -> Self
-        where F: Fn(&Txid) -> bool {
+    where
+        F: Fn(&Txid) -> bool
+    {
         let block_txids: Vec<_> = block.txdata.iter().map(Transaction::txid).collect();
         Self::from_header_txids_with_predicate(&block.header, &block_txids, match_txids)
     }
@@ -440,7 +446,7 @@ impl MerkleBlock {
     /// Create a MerkleBlock from a block, that contains proofs for specific txids.
     #[cfg(feature = "std")]
     #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
-    #[deprecated(since="0.26.2", note="use from_block_with_predicate")]
+    #[deprecated(since = "0.26.2", note = "use from_block_with_predicate")]
     pub fn from_block(block: &Block, match_txids: &::std::collections::HashSet<Txid>) -> Self {
         Self::from_block_with_predicate(block, |t| match_txids.contains(t))
     }
@@ -453,13 +459,16 @@ impl MerkleBlock {
         header: &BlockHeader,
         block_txids: &[Txid],
         match_txids: F,
-    ) -> Self where F: Fn(&Txid) -> bool {
+    ) -> Self
+    where
+        F: Fn(&Txid) -> bool
+    {
         let matches: Vec<bool> = block_txids
             .iter()
             .map(match_txids)
             .collect();
 
-        let pmt = PartialMerkleTree::from_txids(&block_txids, &matches);
+        let pmt = PartialMerkleTree::from_txids(block_txids, &matches);
         MerkleBlock {
             header: *header,
             txn: pmt,
@@ -469,7 +478,7 @@ impl MerkleBlock {
     /// Create a MerkleBlock from the block's header and txids, that should contain proofs for match_txids.
     #[cfg(feature = "std")]
     #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
-    #[deprecated(since="0.26.2", note="use from_header_txids_with_predicate")]
+    #[deprecated(since = "0.26.2", note = "use from_header_txids_with_predicate")]
     pub fn from_header_txids(
         header: &BlockHeader,
         block_txids: &[Txid],
@@ -497,21 +506,18 @@ impl MerkleBlock {
 }
 
 impl Encodable for MerkleBlock {
-    fn consensus_encode<S: io::Write>(
-        &self,
-        mut s: S,
-    ) -> Result<usize, io::Error> {
-        let len = self.header.consensus_encode(&mut s)?
-            + self.txn.consensus_encode(s)?;
+    fn consensus_encode<W: io::Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
+        let len = self.header.consensus_encode(w)?
+            + self.txn.consensus_encode(w)?;
         Ok(len)
     }
 }
 
 impl Decodable for MerkleBlock {
-    fn consensus_decode<D: io::Read>(mut d: D) -> Result<Self, encode::Error> {
+    fn consensus_decode<R: io::Read + ?Sized>(r: &mut R) -> Result<Self, encode::Error> {
         Ok(MerkleBlock {
-            header: Decodable::consensus_decode(&mut d)?,
-            txn: Decodable::consensus_decode(d)?,
+            header: Decodable::consensus_decode(r)?,
+            txn: Decodable::consensus_decode(r)?,
         })
     }
 }
@@ -520,15 +526,15 @@ impl Decodable for MerkleBlock {
 mod tests {
     use core::cmp::min;
 
-    use hashes::Hash;
-    use hashes::hex::{FromHex, ToHex};
-    use hash_types::{Txid, TxMerkleNode};
+    use crate::hashes::Hash;
+    use crate::hashes::hex::{FromHex, ToHex};
+    use crate::hash_types::{Txid, TxMerkleNode};
     use secp256k1::rand::prelude::*;
 
-    use consensus::encode::{deserialize, serialize};
-    use util::hash::bitcoin_merkle_root;
-    use util::merkleblock::{MerkleBlock, PartialMerkleTree};
-    use Block;
+    use crate::consensus::encode::{deserialize, serialize};
+    use crate::util::hash::bitcoin_merkle_root;
+    use crate::util::merkleblock::{MerkleBlock, PartialMerkleTree};
+    use crate::Block;
 
     #[test]
     fn pmt_tests() {
@@ -543,7 +549,7 @@ mod tests {
 
             // Calculate the merkle root and height
             let hashes = txids.iter().map(|t| t.as_hash());
-            let merkle_root_1: TxMerkleNode = bitcoin_merkle_root(hashes).into();
+            let merkle_root_1: TxMerkleNode = bitcoin_merkle_root(hashes).expect("hashes is not empty").into();
             let mut height = 1;
             let mut ntx = num_tx;
             while ntx > 1 {

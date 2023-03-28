@@ -20,50 +20,61 @@
 //! and legacy (before Bip143).
 //!
 
-pub use blockdata::transaction::SigHashType as LegacySigHashType;
-use consensus::{encode, Encodable};
-use core::fmt;
-use core::ops::{Deref, DerefMut};
-use hashes::{sha256, sha256d, Hash};
-use io;
-use util::taproot::{TapLeafHash, TapSighashHash};
-use SigHash;
-use {Script, Transaction, TxOut};
+use crate::blockdata::transaction::EncodeSigningDataResult;
+use crate::prelude::*;
 
-use prelude::*;
+pub use crate::blockdata::transaction::{EcdsaSighashType, SighashTypeParseError};
+use crate::blockdata::witness::Witness;
+use crate::consensus::{encode, Encodable};
+use core::{str, fmt};
+use core::ops::{Deref, DerefMut};
+use core::borrow::Borrow;
+use crate::hashes::{sha256, sha256d, Hash};
+use crate::io;
+use crate::util::taproot::{TapLeafHash, TAPROOT_ANNEX_PREFIX, TapSighashHash};
+use crate::Sighash;
+use crate::{Script, Transaction, TxOut};
 
 use super::taproot::LeafVersion;
 
+/// Used for signature hash for invalid use of SIGHASH_SINGLE.
+pub(crate) const UINT256_ONE: [u8; 32] = [
+    1, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0
+];
+
 /// Efficiently calculates signature hash message for legacy, segwit and taproot inputs.
 #[derive(Debug)]
-pub struct SigHashCache<T: Deref<Target = Transaction>> {
-    /// Access to transaction required for various introspection, moreover type
-    /// `T: Deref<Target=Transaction>` allows to accept borrow and mutable borrow, the
-    /// latter in particular is necessary for [`SigHashCache::witness_mut`]
+pub struct SighashCache<T: Deref<Target=Transaction>> {
+    /// Access to transaction required for transaction introspection. Moreover, type
+    /// `T: Deref<Target=Transaction>` allows us to use borrowed and mutable borrowed types,
+    /// the latter in particular is necessary for [`SighashCache::witness_mut`].
     tx: T,
 
-    /// Common cache for taproot and segwit inputs. It's an option because it's not needed for legacy inputs
+    /// Common cache for taproot and segwit inputs, `None` for legacy inputs.
     common_cache: Option<CommonCache>,
 
-    /// Cache for segwit v0 inputs, it's the result of another round of sha256 on `common_cache`
+    /// Cache for segwit v0 inputs (the result of another round of sha256 on `common_cache`).
     segwit_cache: Option<SegwitCache>,
 
-    /// Cache for taproot v1 inputs
+    /// Cache for taproot v1 inputs.
     taproot_cache: Option<TaprootCache>,
 }
 
-/// Values cached common between segwit and taproot inputs
+/// Common values cached between segwit and taproot inputs.
 #[derive(Debug)]
 struct CommonCache {
     prevouts: sha256::Hash,
     sequences: sha256::Hash,
 
-    /// in theory, `outputs` could be `Option` since `NONE` and `SINGLE` doesn't need it, but since
-    /// `ALL` is the mostly used variant by large, we don't bother
+    /// In theory `outputs` could be an `Option` since `SIGHASH_NONE` and `SIGHASH_SINGLE` do not
+    /// need it, but since `SIGHASH_ALL` is by far the most used variant we don't bother.
     outputs: sha256::Hash,
 }
 
-/// Values cached for segwit inputs, it's equal to [`CommonCache`] plus another round of `sha256`
+/// Values cached for segwit inputs, equivalent to [`CommonCache`] plus another round of `sha256`.
 #[derive(Debug)]
 struct SegwitCache {
     prevouts: sha256d::Hash,
@@ -71,119 +82,172 @@ struct SegwitCache {
     outputs: sha256d::Hash,
 }
 
-/// Values cached for taproot inputs
+/// Values cached for taproot inputs.
 #[derive(Debug)]
 struct TaprootCache {
     amounts: sha256::Hash,
     script_pubkeys: sha256::Hash,
 }
 
-/// Contains outputs of previous transactions.
-/// In the case [`SigHashType`] variant is `ANYONECANPAY`, [`Prevouts::One`] may be provided
+/// Contains outputs of previous transactions. In the case [`SchnorrSighashType`] variant is
+/// `SIGHASH_ANYONECANPAY`, [`Prevouts::One`] may be used.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub enum Prevouts<'u> {
-    /// `One` variant allows to provide the single Prevout needed. It's useful for example
-    /// when modifier `ANYONECANPAY` is provided, only prevout of the current input is needed.
+pub enum Prevouts<'u, T> where T: 'u + Borrow<TxOut> {
+    /// `One` variant allows provision of the single prevout needed. It's useful, for example, when
+    /// modifier `SIGHASH_ANYONECANPAY` is provided, only prevout of the current input is needed.
     /// The first `usize` argument is the input index this [`TxOut`] is referring to.
-    One(usize, &'u TxOut),
-    /// When `ANYONECANPAY` is not provided, or the caller is handy giving all prevouts so the same
-    /// variable can be used for multiple inputs.
-    All(&'u [TxOut]),
+    One(usize, T),
+    /// When `SIGHASH_ANYONECANPAY` is not provided, or when the caller is giving all prevouts so
+    /// the same variable can be used for multiple inputs.
+    All(&'u [T]),
 }
 
 const KEY_VERSION_0: u8 = 0u8;
 
-/// Information related to the script path spending
+/// Information related to the script path spending.
+///
+/// This can be hashed into a [`TapLeafHash`].
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct ScriptPath<'s> {
     script: &'s Script,
-    code_separator_pos: u32,
     leaf_version: LeafVersion,
 }
 
-/// Hashtype of an input's signature, encoded in the last byte of the signature
-/// Fixed values so they can be casted as integer types for encoding
+/// Hashtype of an input's signature, encoded in the last byte of the signature.
+/// Fixed values so they can be cast as integer types for encoding.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub enum SigHashType {
-    /// 0x0: Used when not explicitly specified, defaulting to [`SigHashType::All`]
+pub enum SchnorrSighashType {
+    /// 0x0: Used when not explicitly specified, defaults to [`SchnorrSighashType::All`]
     Default = 0x00,
-    /// 0x1: Sign all outputs
+    /// 0x1: Sign all outputs.
     All = 0x01,
-    /// 0x2: Sign no outputs --- anyone can choose the destination
+    /// 0x2: Sign no outputs --- anyone can choose the destination.
     None = 0x02,
     /// 0x3: Sign the output whose index matches this input's index. If none exists,
     /// sign the hash `0000000000000000000000000000000000000000000000000000000000000001`.
     /// (This rule is probably an unintentional C++ism, but it's consensus so we have
     /// to follow it.)
     Single = 0x03,
-    /// 0x81: Sign all outputs but only this input
+    /// 0x81: Sign all outputs but only this input.
     AllPlusAnyoneCanPay = 0x81,
-    /// 0x82: Sign no outputs and only this input
+    /// 0x82: Sign no outputs and only this input.
     NonePlusAnyoneCanPay = 0x82,
-    /// 0x83: Sign one output and only this input (see `Single` for what "one output" means)
+    /// 0x83: Sign one output and only this input (see `Single` for what "one output" means).
     SinglePlusAnyoneCanPay = 0x83,
+}
+serde_string_impl!(SchnorrSighashType, "a SchnorrSighashType data");
 
-    /// Reserved for future use, `#[non_exhaustive]` is not available with current MSRV
-    Reserved = 0xFF,
+impl fmt::Display for SchnorrSighashType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            SchnorrSighashType::Default => "SIGHASH_DEFAULT",
+            SchnorrSighashType::All => "SIGHASH_ALL",
+            SchnorrSighashType::None => "SIGHASH_NONE",
+            SchnorrSighashType::Single => "SIGHASH_SINGLE",
+            SchnorrSighashType::AllPlusAnyoneCanPay => "SIGHASH_ALL|SIGHASH_ANYONECANPAY",
+            SchnorrSighashType::NonePlusAnyoneCanPay => "SIGHASH_NONE|SIGHASH_ANYONECANPAY",
+            SchnorrSighashType::SinglePlusAnyoneCanPay => "SIGHASH_SINGLE|SIGHASH_ANYONECANPAY",
+        };
+        f.write_str(s)
+    }
 }
 
-/// Possible errors in computing the signature message
+impl str::FromStr for SchnorrSighashType {
+    type Err = SighashTypeParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "SIGHASH_DEFAULT" => Ok(SchnorrSighashType::Default),
+            "SIGHASH_ALL" => Ok(SchnorrSighashType::All),
+            "SIGHASH_NONE" => Ok(SchnorrSighashType::None),
+            "SIGHASH_SINGLE" => Ok(SchnorrSighashType::Single),
+            "SIGHASH_ALL|SIGHASH_ANYONECANPAY" => Ok(SchnorrSighashType::AllPlusAnyoneCanPay),
+            "SIGHASH_NONE|SIGHASH_ANYONECANPAY" => Ok(SchnorrSighashType::NonePlusAnyoneCanPay),
+            "SIGHASH_SINGLE|SIGHASH_ANYONECANPAY" => Ok(SchnorrSighashType::SinglePlusAnyoneCanPay),
+            _ => Err(SighashTypeParseError{ unrecognized: s.to_owned() }),
+        }
+    }
+}
+
+/// Possible errors in computing the signature message.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[non_exhaustive]
 pub enum Error {
     /// Could happen only by using `*_encode_signing_*` methods with custom writers, engines writers
-    /// like the ones used in methods `*_signature_hash` don't error
+    /// like the ones used in methods `*_signature_hash` do not error.
     Io(io::ErrorKind),
 
-    /// Requested index is greater or equal than the number of inputs in the transaction
+    /// Requested index is greater or equal than the number of inputs in the transaction.
     IndexOutOfInputsBounds {
-        /// Requested index
+        /// Requested index.
         index: usize,
-        /// Number of transaction inputs
+        /// Number of transaction inputs.
         inputs_size: usize,
     },
 
-    /// Using SIGHASH_SINGLE without a "corresponding output" (an output with the same index as the
-    /// input being verified) is a validation failure
+    /// Using `SIGHASH_SINGLE` without a "corresponding output" (an output with the same index as
+    /// the input being verified) is a validation failure.
     SingleWithoutCorrespondingOutput {
-        /// Requested index
+        /// Requested index.
         index: usize,
-        /// Number of transaction outputs
+        /// Number of transaction outputs.
         outputs_size: usize,
     },
 
-    /// There are mismatches in the number of prevouts provided compared with the number of
-    /// inputs in the transaction
+    /// There are mismatches in the number of prevouts provided compared to the number of inputs in
+    /// the transaction.
     PrevoutsSize,
 
     /// Requested a prevout index which is greater than the number of prevouts provided or a
-    /// [`Prevouts::One`] with different index
+    /// [`Prevouts::One`] with different index.
     PrevoutIndex,
 
-    /// A single prevout has been provided but all prevouts are needed without `ANYONECANPAY`
+    /// A single prevout has been provided but all prevouts are needed unless using
+    /// `SIGHASH_ANYONECANPAY`.
     PrevoutKind,
 
-    /// Annex must be at least one byte long and the first bytes must be `0x50`
+    /// Annex must be at least one byte long and the first bytes must be `0x50`.
     WrongAnnex,
+
+    /// Invalid Sighash type.
+    InvalidSighashType(u32),
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::Io(ref e) => write!(f, "Writer errored: {:?}", e),
+            Error::Io(error_kind) => write!(f, "writer errored: {:?}", error_kind),
             Error::IndexOutOfInputsBounds { index, inputs_size } => write!(f, "Requested index ({}) is greater or equal than the number of transaction inputs ({})", index, inputs_size),
             Error::SingleWithoutCorrespondingOutput { index, outputs_size } => write!(f, "SIGHASH_SINGLE for input ({}) haven't a corresponding output (#outputs:{})", index, outputs_size),
             Error::PrevoutsSize => write!(f, "Number of supplied prevouts differs from the number of inputs in transaction"),
             Error::PrevoutIndex => write!(f, "The index requested is greater than available prevouts or different from the provided [Provided::Anyone] index"),
             Error::PrevoutKind => write!(f, "A single prevout has been provided but all prevouts are needed without `ANYONECANPAY`"),
             Error::WrongAnnex => write!(f, "Annex must be at least one byte long and the first bytes must be `0x50`"),
+            Error::InvalidSighashType(hash_ty) => write!(f, "Invalid schnorr Signature hash type : {} ", hash_ty),
         }
     }
 }
 
 #[cfg(feature = "std")]
-impl ::std::error::Error for Error {}
+#[cfg_attr(docsrs, doc(cfg(feature = "std")))]
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        use self::Error::*;
 
-impl<'u> Prevouts<'u> {
+        match self {
+            Io(_)
+            | IndexOutOfInputsBounds { .. }
+            | SingleWithoutCorrespondingOutput { .. }
+            | PrevoutsSize
+            | PrevoutIndex
+            | PrevoutKind
+            | WrongAnnex
+            | InvalidSighashType(_) => None,
+        }
+    }
+}
+
+impl<'u, T> Prevouts<'u, T> where T: Borrow<TxOut> {
     fn check_all(&self, tx: &Transaction) -> Result<(), Error> {
         if let Prevouts::All(prevouts) = self {
             if prevouts.len() != tx.input.len() {
@@ -193,9 +257,9 @@ impl<'u> Prevouts<'u> {
         Ok(())
     }
 
-    fn get_all(&self) -> Result<&[TxOut], Error> {
+    fn get_all(&self) -> Result<&[T], Error> {
         match self {
-            Prevouts::All(prevouts) => Ok(prevouts),
+            Prevouts::All(prevouts) => Ok(*prevouts),
             _ => Err(Error::PrevoutKind),
         }
     }
@@ -204,67 +268,106 @@ impl<'u> Prevouts<'u> {
         match self {
             Prevouts::One(index, prevout) => {
                 if input_index == *index {
-                    Ok(prevout)
+                    Ok(prevout.borrow())
                 } else {
                     Err(Error::PrevoutIndex)
                 }
             }
-            Prevouts::All(prevouts) => prevouts.get(input_index).ok_or(Error::PrevoutIndex),
+            Prevouts::All(prevouts) => prevouts
+                .get(input_index)
+                .map(|x| x.borrow())
+                .ok_or(Error::PrevoutIndex),
         }
     }
 }
 
 impl<'s> ScriptPath<'s> {
-    /// Create a new ScriptPath structure
-    pub fn new(script: &'s Script, code_separator_pos: u32, leaf_version: LeafVersion) -> Self {
+    /// Creates a new `ScriptPath` structure.
+    pub fn new(script: &'s Script, leaf_version: LeafVersion) -> Self {
         ScriptPath {
             script,
-            code_separator_pos,
             leaf_version,
         }
     }
-    /// Create a new ScriptPath structure using default values for `code_separator_pos` and `leaf_version`
+    /// Creates a new `ScriptPath` structure using default leaf version value.
     pub fn with_defaults(script: &'s Script) -> Self {
-        Self::new(script, 0xFFFFFFFFu32, LeafVersion::default())
+        Self::new(script, LeafVersion::TapScript)
+    }
+    /// Computes the leaf hash for this `ScriptPath`.
+    pub fn leaf_hash(&self) -> TapLeafHash {
+        let mut enc = TapLeafHash::engine();
+
+        self.leaf_version.to_consensus().consensus_encode(&mut enc).expect("Writing to hash enging should never fail");
+        self.script.consensus_encode(&mut enc).expect("Writing to hash enging should never fail");
+
+        TapLeafHash::from_engine(enc)
     }
 }
 
-impl From<LegacySigHashType> for SigHashType {
-    fn from(s: LegacySigHashType) -> Self {
+impl<'s> From<ScriptPath<'s>> for TapLeafHash {
+    fn from(script_path: ScriptPath<'s>) -> TapLeafHash {
+        script_path.leaf_hash()
+    }
+}
+
+impl From<EcdsaSighashType> for SchnorrSighashType {
+    fn from(s: EcdsaSighashType) -> Self {
         match s {
-            LegacySigHashType::All => SigHashType::All,
-            LegacySigHashType::None => SigHashType::None,
-            LegacySigHashType::Single => SigHashType::Single,
-            LegacySigHashType::AllPlusAnyoneCanPay => SigHashType::AllPlusAnyoneCanPay,
-            LegacySigHashType::NonePlusAnyoneCanPay => SigHashType::NonePlusAnyoneCanPay,
-            LegacySigHashType::SinglePlusAnyoneCanPay => SigHashType::SinglePlusAnyoneCanPay,
+            EcdsaSighashType::All => SchnorrSighashType::All,
+            EcdsaSighashType::None => SchnorrSighashType::None,
+            EcdsaSighashType::Single => SchnorrSighashType::Single,
+            EcdsaSighashType::AllPlusAnyoneCanPay => SchnorrSighashType::AllPlusAnyoneCanPay,
+            EcdsaSighashType::NonePlusAnyoneCanPay => SchnorrSighashType::NonePlusAnyoneCanPay,
+            EcdsaSighashType::SinglePlusAnyoneCanPay => SchnorrSighashType::SinglePlusAnyoneCanPay,
         }
     }
 }
 
-impl SigHashType {
-    /// Break the sighash flag into the "real" sighash flag and the ANYONECANPAY boolean
-    pub(crate) fn split_anyonecanpay_flag(self) -> (SigHashType, bool) {
+impl SchnorrSighashType {
+    /// Breaks the sighash flag into the "real" sighash flag and the `SIGHASH_ANYONECANPAY` boolean.
+    pub(crate) fn split_anyonecanpay_flag(self) -> (SchnorrSighashType, bool) {
         match self {
-            SigHashType::Default => (SigHashType::Default, false),
-            SigHashType::All => (SigHashType::All, false),
-            SigHashType::None => (SigHashType::None, false),
-            SigHashType::Single => (SigHashType::Single, false),
-            SigHashType::AllPlusAnyoneCanPay => (SigHashType::All, true),
-            SigHashType::NonePlusAnyoneCanPay => (SigHashType::None, true),
-            SigHashType::SinglePlusAnyoneCanPay => (SigHashType::Single, true),
-            SigHashType::Reserved => (SigHashType::Reserved, false),
+            SchnorrSighashType::Default => (SchnorrSighashType::Default, false),
+            SchnorrSighashType::All => (SchnorrSighashType::All, false),
+            SchnorrSighashType::None => (SchnorrSighashType::None, false),
+            SchnorrSighashType::Single => (SchnorrSighashType::Single, false),
+            SchnorrSighashType::AllPlusAnyoneCanPay => (SchnorrSighashType::All, true),
+            SchnorrSighashType::NonePlusAnyoneCanPay => (SchnorrSighashType::None, true),
+            SchnorrSighashType::SinglePlusAnyoneCanPay => (SchnorrSighashType::Single, true),
         }
+    }
+
+    /// Creates a [`SchnorrSighashType`] from raw `u8`.
+    #[deprecated(since = "0.29.0", note = "use from_consensus_u8 instead")]
+    pub fn from_u8(hash_ty: u8) -> Result<Self, Error> {
+        Self::from_consensus_u8(hash_ty)
+    }
+
+    /// Constructs a [`SchnorrSighashType`] from a raw `u8`.
+    pub fn from_consensus_u8(hash_ty: u8) -> Result<Self, Error> {
+    use SchnorrSighashType::*;
+
+        Ok(match hash_ty {
+            0x00 => Default,
+            0x01 => All,
+            0x02 => None,
+            0x03 => Single,
+            0x81 => AllPlusAnyoneCanPay,
+            0x82 => NonePlusAnyoneCanPay,
+            0x83 => SinglePlusAnyoneCanPay,
+            x => return Err(Error::InvalidSighashType(x as u32)),
+        })
     }
 }
 
-impl<R: Deref<Target = Transaction>> SigHashCache<R> {
-    /// Compute the sighash components from an unsigned transaction and auxiliary
-    /// in a lazy manner when required.
-    /// For the generated sighashes to be valid, no fields in the transaction may change except for
-    /// script_sig and witnesses.
+impl<R: Deref<Target = Transaction>> SighashCache<R> {
+    /// Constructs a new `SighashCache` from an unsigned transaction.
+    ///
+    /// The sighash components are computed in a lazy manner when required. For the generated
+    /// sighashes to be valid, no fields in the transaction may change except for script_sig and
+    /// witness.
     pub fn new(tx: R) -> Self {
-        SigHashCache {
+        SighashCache {
             tx,
             common_cache: None,
             taproot_cache: None,
@@ -272,16 +375,16 @@ impl<R: Deref<Target = Transaction>> SigHashCache<R> {
         }
     }
 
-    /// Encode the BIP341 signing data for any flag type into a given object implementing a
-    /// io::Write trait.
-    pub fn taproot_encode_signing_data_to<Write: io::Write>(
+    /// Encodes the BIP341 signing data for any flag type into a given object implementing a
+    /// [`io::Write`] trait.
+    pub fn taproot_encode_signing_data_to<Write: io::Write, T: Borrow<TxOut>>(
         &mut self,
         mut writer: Write,
         input_index: usize,
-        prevouts: &Prevouts,
+        prevouts: &Prevouts<T>,
         annex: Option<Annex>,
-        script_path: Option<ScriptPath>,
-        sighash_type: SigHashType,
+        leaf_hash_code_separator: Option<(TapLeafHash, u32)>,
+        sighash_type: SchnorrSighashType,
     ) -> Result<(), Error> {
         prevouts.check_all(&self.tx)?;
 
@@ -321,7 +424,7 @@ impl<R: Deref<Target = Transaction>> SigHashCache<R> {
 
         // If hash_type & 3 does not equal SIGHASH_NONE or SIGHASH_SINGLE:
         //     sha_outputs (32): the SHA256 of the serialization of all outputs in CTxOut format.
-        if sighash != SigHashType::None && sighash != SigHashType::Single {
+        if sighash != SchnorrSighashType::None && sighash != SchnorrSighashType::Single {
             self.common_cache().outputs.consensus_encode(&mut writer)?;
         }
 
@@ -332,7 +435,7 @@ impl<R: Deref<Target = Transaction>> SigHashCache<R> {
         if annex.is_some() {
             spend_type |= 1u8;
         }
-        if script_path.is_some() {
+        if leaf_hash_code_separator.is_some() {
             spend_type |= 2u8;
         }
         spend_type.consensus_encode(&mut writer)?;
@@ -348,7 +451,7 @@ impl<R: Deref<Target = Transaction>> SigHashCache<R> {
                     .tx
                     .input
                     .get(input_index)
-                    .ok_or_else(|| Error::IndexOutOfInputsBounds {
+                    .ok_or(Error::IndexOutOfInputsBounds {
                         index: input_index,
                         inputs_size: self.tx.input.len(),
                     })?;
@@ -376,12 +479,12 @@ impl<R: Deref<Target = Transaction>> SigHashCache<R> {
         // * Data about this output:
         // If hash_type & 3 equals SIGHASH_SINGLE:
         //      sha_single_output (32): the SHA256 of the corresponding output in CTxOut format.
-        if sighash == SigHashType::Single {
+        if sighash == SchnorrSighashType::Single {
             let mut enc = sha256::Hash::engine();
             self.tx
                 .output
                 .get(input_index)
-                .ok_or_else(|| Error::SingleWithoutCorrespondingOutput {
+                .ok_or(Error::SingleWithoutCorrespondingOutput {
                     index: input_index,
                     outputs_size: self.tx.output.len(),
                 })?
@@ -394,17 +497,7 @@ impl<R: Deref<Target = Transaction>> SigHashCache<R> {
         //         ss += TaggedHash("TapLeaf", bytes([leaf_ver]) + ser_string(script))
         //         ss += bytes([0])
         //         ss += struct.pack("<i", codeseparator_pos)
-        if let Some(ScriptPath {
-            script,
-            leaf_version,
-            code_separator_pos,
-        }) = script_path
-        {
-            let mut enc = TapLeafHash::engine();
-            leaf_version.as_u8().consensus_encode(&mut enc)?;
-            script.consensus_encode(&mut enc)?;
-            let hash = TapLeafHash::from_engine(enc);
-
+        if let Some((hash, code_separator_pos)) = leaf_hash_code_separator {
             hash.into_inner().consensus_encode(&mut writer)?;
             KEY_VERSION_0.consensus_encode(&mut writer)?;
             code_separator_pos.consensus_encode(&mut writer)?;
@@ -413,14 +506,14 @@ impl<R: Deref<Target = Transaction>> SigHashCache<R> {
         Ok(())
     }
 
-    /// Compute the BIP341 sighash for any flag type.
-    pub fn taproot_signature_hash(
+    /// Computes the BIP341 sighash for any flag type.
+    pub fn taproot_signature_hash<T: Borrow<TxOut>>(
         &mut self,
         input_index: usize,
-        prevouts: &Prevouts,
+        prevouts: &Prevouts<T>,
         annex: Option<Annex>,
-        script_path: Option<ScriptPath>,
-        sighash_type: SigHashType,
+        leaf_hash_code_separator: Option<(TapLeafHash, u32)>,
+        sighash_type: SchnorrSighashType,
     ) -> Result<TapSighashHash, Error> {
         let mut enc = TapSighashHash::engine();
         self.taproot_encode_signing_data_to(
@@ -428,13 +521,55 @@ impl<R: Deref<Target = Transaction>> SigHashCache<R> {
             input_index,
             prevouts,
             annex,
-            script_path,
+            leaf_hash_code_separator,
             sighash_type,
         )?;
         Ok(TapSighashHash::from_engine(enc))
     }
 
-    /// Encode the BIP143 signing data for any flag type into a given object implementing a
+    /// Computes the BIP341 sighash for a key spend.
+    pub fn taproot_key_spend_signature_hash<T: Borrow<TxOut>>(
+        &mut self,
+        input_index: usize,
+        prevouts: &Prevouts<T>,
+        sighash_type: SchnorrSighashType,
+    ) -> Result<TapSighashHash, Error> {
+        let mut enc = TapSighashHash::engine();
+        self.taproot_encode_signing_data_to(
+            &mut enc,
+            input_index,
+            prevouts,
+            None,
+            None,
+            sighash_type,
+        )?;
+        Ok(TapSighashHash::from_engine(enc))
+    }
+
+    /// Computes the BIP341 sighash for a script spend.
+    ///
+    /// Assumes the default `OP_CODESEPARATOR` position of `0xFFFFFFFF`. Custom values can be
+    /// provided through the more fine-grained API of [`SighashCache::taproot_encode_signing_data_to`].
+    pub fn taproot_script_spend_signature_hash<S: Into<TapLeafHash>, T: Borrow<TxOut>>(
+        &mut self,
+        input_index: usize,
+        prevouts: &Prevouts<T>,
+        leaf_hash: S,
+        sighash_type: SchnorrSighashType,
+    ) -> Result<TapSighashHash, Error> {
+        let mut enc = TapSighashHash::engine();
+        self.taproot_encode_signing_data_to(
+            &mut enc,
+            input_index,
+            prevouts,
+            None,
+            Some((leaf_hash.into(), 0xFFFFFFFF)),
+            sighash_type,
+        )?;
+        Ok(TapSighashHash::from_engine(enc))
+    }
+
+    /// Encodes the BIP143 signing data for any flag type into a given object implementing a
     /// [`std::io::Write`] trait.
     pub fn segwit_encode_signing_data_to<Write: io::Write>(
         &mut self,
@@ -442,7 +577,7 @@ impl<R: Deref<Target = Transaction>> SigHashCache<R> {
         input_index: usize,
         script_code: &Script,
         value: u64,
-        sighash_type: LegacySigHashType,
+        sighash_type: EcdsaSighashType,
     ) -> Result<(), Error> {
         let zero_hash = sha256d::Hash::default();
 
@@ -457,8 +592,8 @@ impl<R: Deref<Target = Transaction>> SigHashCache<R> {
         }
 
         if !anyone_can_pay
-            && sighash != LegacySigHashType::Single
-            && sighash != LegacySigHashType::None
+            && sighash != EcdsaSighashType::Single
+            && sighash != EcdsaSighashType::None
         {
             self.segwit_cache()
                 .sequences
@@ -473,7 +608,7 @@ impl<R: Deref<Target = Transaction>> SigHashCache<R> {
                     .tx
                     .input
                     .get(input_index)
-                    .ok_or_else(|| Error::IndexOutOfInputsBounds {
+                    .ok_or(Error::IndexOutOfInputsBounds {
                         index: input_index,
                         inputs_size: self.tx.input.len(),
                     })?;
@@ -484,30 +619,30 @@ impl<R: Deref<Target = Transaction>> SigHashCache<R> {
             txin.sequence.consensus_encode(&mut writer)?;
         }
 
-        if sighash != LegacySigHashType::Single && sighash != LegacySigHashType::None {
+        if sighash != EcdsaSighashType::Single && sighash != EcdsaSighashType::None {
             self.segwit_cache().outputs.consensus_encode(&mut writer)?;
-        } else if sighash == LegacySigHashType::Single && input_index < self.tx.output.len() {
-            let mut single_enc = SigHash::engine();
+        } else if sighash == EcdsaSighashType::Single && input_index < self.tx.output.len() {
+            let mut single_enc = Sighash::engine();
             self.tx.output[input_index].consensus_encode(&mut single_enc)?;
-            SigHash::from_engine(single_enc).consensus_encode(&mut writer)?;
+            Sighash::from_engine(single_enc).consensus_encode(&mut writer)?;
         } else {
             zero_hash.consensus_encode(&mut writer)?;
         }
 
         self.tx.lock_time.consensus_encode(&mut writer)?;
-        sighash_type.as_u32().consensus_encode(&mut writer)?;
+        sighash_type.to_u32().consensus_encode(&mut writer)?;
         Ok(())
     }
 
-    /// Compute the BIP143 sighash for any flag type.
+    /// Computes the BIP143 sighash for any flag type.
     pub fn segwit_signature_hash(
         &mut self,
         input_index: usize,
         script_code: &Script,
         value: u64,
-        sighash_type: LegacySigHashType,
-    ) -> Result<SigHash, Error> {
-        let mut enc = SigHash::engine();
+        sighash_type: EcdsaSighashType,
+    ) -> Result<Sighash, Error> {
+        let mut enc = Sighash::engine();
         self.segwit_encode_signing_data_to(
             &mut enc,
             input_index,
@@ -515,40 +650,44 @@ impl<R: Deref<Target = Transaction>> SigHashCache<R> {
             value,
             sighash_type,
         )?;
-        Ok(SigHash::from_engine(enc))
+        Ok(Sighash::from_engine(enc))
     }
 
-    /// Encode the legacy signing data for any flag type into a given object implementing a
-    /// [`std::io::Write`] trait. Internally calls [`Transaction::encode_signing_data_to`]
+    /// Encodes the legacy signing data for any flag type into a given object implementing a
+    /// [`std::io::Write`] trait. Internally calls [`Transaction::encode_signing_data_to`].
     pub fn legacy_encode_signing_data_to<Write: io::Write, U: Into<u32>>(
         &self,
         mut writer: Write,
         input_index: usize,
         script_pubkey: &Script,
         sighash_type: U,
-    ) -> Result<(), Error> {
+    ) -> EncodeSigningDataResult<Error> {
         if input_index >= self.tx.input.len() {
-            return Err(Error::IndexOutOfInputsBounds {
+            return EncodeSigningDataResult::WriteResult(Err(Error::IndexOutOfInputsBounds {
                 index: input_index,
                 inputs_size: self.tx.input.len(),
-            });
+            }));
         }
+
         self.tx
             .encode_signing_data_to(&mut writer, input_index, script_pubkey, sighash_type.into())
-            .expect("writers don't error");
-        Ok(())
+            .map_err(|e| e.into())
     }
 
-    /// Computes the legacy sighash for any SigHashType
+    /// Computes the legacy sighash for any `sighash_type`.
     pub fn legacy_signature_hash(
         &self,
         input_index: usize,
         script_pubkey: &Script,
         sighash_type: u32,
-    ) -> Result<SigHash, Error> {
-        let mut enc = SigHash::engine();
-        self.legacy_encode_signing_data_to(&mut enc, input_index, script_pubkey, sighash_type)?;
-        Ok(SigHash::from_engine(enc))
+    ) -> Result<Sighash, Error> {
+        let mut enc = Sighash::engine();
+        if self.legacy_encode_signing_data_to(&mut enc, input_index, script_pubkey, sighash_type)
+            .is_sighash_single_bug()? {
+            Ok(Sighash::from_inner(UINT256_ONE))
+        } else {
+            Ok(Sighash::from_engine(enc))
+        }
     }
 
     #[inline]
@@ -602,13 +741,15 @@ impl<R: Deref<Target = Transaction>> SigHashCache<R> {
         })
     }
 
-    fn taproot_cache(&mut self, prevouts: &[TxOut]) -> &TaprootCache {
+    fn taproot_cache<T: Borrow<TxOut>>(&mut self, prevouts: &[T]) -> &TaprootCache
+    {
         self.taproot_cache.get_or_insert_with(|| {
             let mut enc_amounts = sha256::Hash::engine();
             let mut enc_script_pubkeys = sha256::Hash::engine();
             for prevout in prevouts {
-                prevout.value.consensus_encode(&mut enc_amounts).unwrap();
+                prevout.borrow().value.consensus_encode(&mut enc_amounts).unwrap();
                 prevout
+                    .borrow()
                     .script_pubkey
                     .consensus_encode(&mut enc_script_pubkeys)
                     .unwrap();
@@ -621,28 +762,28 @@ impl<R: Deref<Target = Transaction>> SigHashCache<R> {
     }
 }
 
-impl<R: DerefMut<Target = Transaction>> SigHashCache<R> {
-    /// When the SigHashCache is initialized with a mutable reference to a transaction instead of a
-    /// regular reference, this method is available to allow modification to the witnesses.
+impl<R: DerefMut<Target=Transaction>> SighashCache<R> {
+    /// When the `SighashCache` is initialized with a mutable reference to a transaction instead of
+    /// a regular reference, this method is available to allow modification to the witnesses.
     ///
     /// This allows in-line signing such as
     /// ```
-    /// use bitcoin::blockdata::transaction::{Transaction, SigHashType};
-    /// use bitcoin::util::sighash::SigHashCache;
+    /// use bitcoin::blockdata::transaction::{Transaction, EcdsaSighashType};
+    /// use bitcoin::util::sighash::SighashCache;
     /// use bitcoin::Script;
     ///
     /// let mut tx_to_sign = Transaction { version: 2, lock_time: 0, input: Vec::new(), output: Vec::new() };
     /// let input_count = tx_to_sign.input.len();
     ///
-    /// let mut sig_hasher = SigHashCache::new(&mut tx_to_sign);
+    /// let mut sig_hasher = SighashCache::new(&mut tx_to_sign);
     /// for inp in 0..input_count {
     ///     let prevout_script = Script::new();
-    ///     let _sighash = sig_hasher.segwit_signature_hash(inp, &prevout_script, 42, SigHashType::All);
+    ///     let _sighash = sig_hasher.segwit_signature_hash(inp, &prevout_script, 42, EcdsaSighashType::All);
     ///     // ... sign the sighash
-    ///     sig_hasher.witness_mut(inp).unwrap().push(Vec::new());
+    ///     sig_hasher.witness_mut(inp).unwrap().push(&Vec::new());
     /// }
     /// ```
-    pub fn witness_mut(&mut self, input_index: usize) -> Option<&mut Vec<Vec<u8>>> {
+    pub fn witness_mut(&mut self, input_index: usize) -> Option<&mut Witness> {
         self.tx.input.get_mut(input_index).map(|i| &mut i.witness)
     }
 }
@@ -653,40 +794,46 @@ impl From<io::Error> for Error {
     }
 }
 
+/// The `Annex` struct is a slice wrapper enforcing first byte is `0x50`.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
-/// The `Annex` struct is a slice wrapper enforcing first byte to be `0x50`
 pub struct Annex<'a>(&'a [u8]);
 
 impl<'a> Annex<'a> {
-    /// Creates a new `Annex` struct checking the first byte is `0x50`
+    /// Creates a new `Annex` struct checking the first byte is `0x50`.
     pub fn new(annex_bytes: &'a [u8]) -> Result<Self, Error> {
-        if annex_bytes.first() == Some(&0x50) {
+        if annex_bytes.first() == Some(&TAPROOT_ANNEX_PREFIX) {
             Ok(Annex(annex_bytes))
         } else {
             Err(Error::WrongAnnex)
         }
     }
 
-    /// Returns the Annex bytes data (including first byte `0x50`)
+    /// Returns the Annex bytes data (including first byte `0x50`).
     pub fn as_bytes(&self) -> &[u8] {
         &*self.0
     }
 }
 
 impl<'a> Encodable for Annex<'a> {
-    fn consensus_encode<W: io::Write>(&self, writer: W) -> Result<usize, io::Error> {
-        encode::consensus_encode_with_size(&self.0, writer)
+    fn consensus_encode<W: io::Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
+        encode::consensus_encode_with_size(self.0, w)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use consensus::deserialize;
-    use hashes::hex::FromHex;
-    use hashes::{Hash, HashEngine};
-    use util::sighash::{Annex, Error, Prevouts, ScriptPath, SigHashCache, SigHashType};
-    use util::taproot::TapSighashHash;
-    use {Script, Transaction, TxIn, TxOut};
+    use super::*;
+    use crate::consensus::deserialize;
+    use crate::hashes::hex::FromHex;
+    use crate::hashes::{Hash, HashEngine};
+    use crate::util::sighash::{Annex, Error, Prevouts, ScriptPath, SighashCache};
+    use std::str::FromStr;
+    use crate::hashes::hex::ToHex;
+    use crate::util::taproot::{TapTweakHash, TapSighashHash, TapBranchHash, TapLeafHash};
+    use secp256k1::{self, SecretKey, XOnlyPublicKey};
+    extern crate serde_json;
+
+    use crate::{Script, Transaction, TxIn, TxOut};
 
     #[test]
     fn test_tap_sighash_hash() {
@@ -709,7 +856,7 @@ mod tests {
             "01365724000000000023542156b39dab4f8f3508e0432cfb41fab110170acaa2d4c42539cb90a4dc7c093bc500",
             0,
             "33ca0ebfb4a945eeee9569fc0f5040221275f88690b7f8592ada88ce3bdf6703",
-            SigHashType::Default, None,None,
+            SchnorrSighashType::Default, None, None, None
         );
 
         test_taproot_sighash(
@@ -717,7 +864,7 @@ mod tests {
             "02591f220000000000225120f25ad35583ea31998d968871d7de1abd2a52f6fe4178b54ea158274806ff4ece48fb310000000000225120f25ad35583ea31998d968871d7de1abd2a52f6fe4178b54ea158274806ff4ece",
             1,
             "626ab955d58c9a8a600a0c580549d06dc7da4e802eb2a531f62a588e430967a8",
-            SigHashType::All, None,None,
+            SchnorrSighashType::All, None, None, None
         );
 
         test_taproot_sighash(
@@ -725,7 +872,7 @@ mod tests {
             "01c4811000000000002251201bf9297d0a2968ae6693aadd0fa514717afefd218087a239afb7418e2d22e65c",
             0,
             "dfa9437f9c9a1d1f9af271f79f2f5482f287cdb0d2e03fa92c8a9b216cc6061c",
-            SigHashType::AllPlusAnyoneCanPay, None,None,
+            SchnorrSighashType::AllPlusAnyoneCanPay, None, None, None
         );
 
         test_taproot_sighash(
@@ -733,7 +880,7 @@ mod tests {
             "0144c84d0000000000225120e3f2107989c88e67296ab2faca930efa2e3a5bd3ff0904835a11c9e807458621",
             0,
             "3129de36a5d05fff97ffca31eb75fcccbbbc27b3147a7a36a9e4b45d8b625067",
-            SigHashType::None, None,None,
+            SchnorrSighashType::None, None, None, None
         );
 
         test_taproot_sighash(
@@ -741,7 +888,7 @@ mod tests {
             "013fed110000000000225120eb536ae8c33580290630fc495046e998086a64f8f33b93b07967d9029b265c55",
             0,
             "2441e8b0e063a2083ee790f14f2045022f07258ddde5ee01de543c9e789d80ae",
-            SigHashType::NonePlusAnyoneCanPay, None,None,
+            SchnorrSighashType::NonePlusAnyoneCanPay, None, None, None
         );
 
         test_taproot_sighash(
@@ -749,7 +896,7 @@ mod tests {
             "01efa558000000000022512007071ea3dc7e331b0687d0193d1e6d6ed10e645ef36f10ef8831d5e522ac9e80",
             0,
             "30239345177cadd0e3ea413d49803580abb6cb27971b481b7788a78d35117a88",
-            SigHashType::Single, None,None,
+            SchnorrSighashType::Single, None, None, None
         );
 
         test_taproot_sighash(
@@ -757,7 +904,7 @@ mod tests {
             "0107af4e00000000002251202c36d243dfc06cb56a248e62df27ecba7417307511a81ae61aa41c597a929c69",
             0,
             "bf9c83f26c6dd16449e4921f813f551c4218e86f2ec906ca8611175b41b566df",
-            SigHashType::SinglePlusAnyoneCanPay, None,None,
+            SchnorrSighashType::SinglePlusAnyoneCanPay, None, None, None
         );
     }
 
@@ -768,8 +915,9 @@ mod tests {
             "01ea49260000000000225120ab5e9800806bf18cb246edcf5fe63441208fe955a4b5a35bbff65f5db622a010",
             0,
             "3b003000add359a364a156e73e02846782a59d0d95ca8c4638aaad99f2ef915c",
-            SigHashType::SinglePlusAnyoneCanPay,
+            SchnorrSighashType::SinglePlusAnyoneCanPay,
             Some("507b979802e62d397acb29f56743a791894b99372872fc5af06a4f6e8d242d0615cda53062bb20e6ec79756fe39183f0c128adfe85559a8fa042b042c018aa8010143799e44f0893c40e1e"),
+            None,
             None,
         );
     }
@@ -781,9 +929,24 @@ mod tests {
             "011bec34000000000022512028055142ea437db73382e991861446040b61dd2185c4891d7daf6893d79f7182",
             0,
             "d66de5274a60400c7b08c86ba6b7f198f40660079edf53aca89d2a9501317f2e",
-            SigHashType::All,
+            SchnorrSighashType::All,
             None,
             Some("20cc4e1107aea1d170c5ff5b6817e1303010049724fb3caa7941792ea9d29b3e2bacab"),
+            None,
+        );
+    }
+
+    #[test]
+    fn test_sighashes_with_script_path_raw_hash() {
+        test_taproot_sighash(
+            "020000000189fc651483f9296b906455dd939813bf086b1bbe7c77635e157c8e14ae29062195010000004445b5c7044561320000000000160014331414dbdada7fb578f700f38fb69995fc9b5ab958020000000000001976a914268db0a8104cc6d8afd91233cc8b3d1ace8ac3ef88ac580200000000000017a914ec00dcb368d6a693e11986d265f659d2f59e8be2875802000000000000160014c715799a49a0bae3956df9c17cb4440a673ac0df6f010000",
+            "011bec34000000000022512028055142ea437db73382e991861446040b61dd2185c4891d7daf6893d79f7182",
+            0,
+            "d66de5274a60400c7b08c86ba6b7f198f40660079edf53aca89d2a9501317f2e",
+            SchnorrSighashType::All,
+            None,
+            None,
+            Some("15a2530514e399f8b5cf0b3d3112cf5b289eaa3e308ba2071b58392fdc6da68a"),
         );
     }
 
@@ -794,9 +957,10 @@ mod tests {
             "011458360000000000225120a7baec3fb9f84614e3899fcc010c638f80f13539344120e1f4d8b68a9a011a13",
             0,
             "a0042aa434f9a75904b64043f2a283f8b4c143c7f4f7f49a6cbe5b9f745f4c15",
-            SigHashType::All,
+            SchnorrSighashType::All,
             Some("50a6272b470e1460e3332ade7bb14b81671c564fb6245761bd5bd531394b28860e0b3808ab229fb51791fb6ae6fa82d915b2efb8f6df83ae1f5ab3db13e30928875e2a22b749d89358de481f19286cd4caa792ce27f9559082d227a731c5486882cc707f83da361c51b7aadd9a0cf68fe7480c410fa137b454482d9a1ebf0f96d760b4d61426fc109c6e8e99a508372c45caa7b000a41f8251305da3f206c1849985ba03f3d9592832b4053afbd23ab25d0465df0bc25a36c223aacf8e04ec736a418c72dc319e4da3e972e349713ca600965e7c665f2090d5a70e241ac164115a1f5639f28b1773327715ca307ace64a2de7f0e3df70a2ffee3857689f909c0dad46d8a20fa373a4cc6eed6d4c9806bf146f0d76baae1"),
             Some("7520ab9160dd8299dc1367659be3e8f66781fe440d52940c7f8d314a89b9f2698d406ead6ead6ead6ead6ead6ead6ead6ead6ead6ead6ead6ead6ead6ead6ead6ead6ead6ead6ead6ead6ead6ead6ead6ead6ead6ead6ead6ead6ead6ead6ead6ead6ead6ead6ead6ead6ead6ead6ead6ead6ead6ead6ead6ead6ead6ead6ead6ead6ead6ead6ead6ead6ead6ead6ead6ead6ead6ead6ead6eadac"),
+            None,
         );
     }
 
@@ -808,30 +972,33 @@ mod tests {
             input: vec![TxIn::default()],
             output: vec![],
         };
-        let mut c = SigHashCache::new(&dumb_tx);
+        let mut c = SighashCache::new(&dumb_tx);
 
+        // 1.29 fixes
+        let empty_vec = vec![];
+        let empty_prevouts : Prevouts<TxOut> = Prevouts::All(&empty_vec);
         assert_eq!(
-            c.taproot_signature_hash(0, &Prevouts::All(&vec![]), None, None, SigHashType::All),
+            c.taproot_signature_hash(0, &empty_prevouts, None, None, SchnorrSighashType::All),
             Err(Error::PrevoutsSize)
         );
         let two = vec![TxOut::default(), TxOut::default()];
         let too_many_prevouts = Prevouts::All(&two);
         assert_eq!(
-            c.taproot_signature_hash(0, &too_many_prevouts, None, None, SigHashType::All),
+            c.taproot_signature_hash(0, &too_many_prevouts, None, None, SchnorrSighashType::All),
             Err(Error::PrevoutsSize)
         );
         let tx_out = TxOut::default();
         let prevout = Prevouts::One(1, &tx_out);
         assert_eq!(
-            c.taproot_signature_hash(0, &prevout, None, None, SigHashType::All),
+            c.taproot_signature_hash(0, &prevout, None, None, SchnorrSighashType::All),
             Err(Error::PrevoutKind)
         );
         assert_eq!(
-            c.taproot_signature_hash(0, &prevout, None, None, SigHashType::AllPlusAnyoneCanPay),
+            c.taproot_signature_hash(0, &prevout, None, None, SchnorrSighashType::AllPlusAnyoneCanPay),
             Err(Error::PrevoutIndex)
         );
         assert_eq!(
-            c.taproot_signature_hash(10, &prevout, None, None, SigHashType::AllPlusAnyoneCanPay),
+            c.taproot_signature_hash(10, &prevout, None, None, SchnorrSighashType::AllPlusAnyoneCanPay),
             Err(Error::IndexOutOfInputsBounds {
                 index: 10,
                 inputs_size: 1
@@ -839,7 +1006,7 @@ mod tests {
         );
         let prevout = Prevouts::One(0, &tx_out);
         assert_eq!(
-            c.taproot_signature_hash(0, &prevout, None, None, SigHashType::SinglePlusAnyoneCanPay),
+            c.taproot_signature_hash(0, &prevout, None, None, SchnorrSighashType::SinglePlusAnyoneCanPay),
             Err(Error::SingleWithoutCorrespondingOutput {
                 index: 0,
                 outputs_size: 0
@@ -856,19 +1023,21 @@ mod tests {
 
     #[test]
     fn test_annex_errors() {
-        assert_eq!(Annex::new(&vec![]), Err(Error::WrongAnnex));
-        assert_eq!(Annex::new(&vec![0x51]), Err(Error::WrongAnnex));
-        assert_eq!(Annex::new(&vec![0x51, 0x50]), Err(Error::WrongAnnex));
+        assert_eq!(Annex::new(&[]), Err(Error::WrongAnnex));
+        assert_eq!(Annex::new(&[0x51]), Err(Error::WrongAnnex));
+        assert_eq!(Annex::new(&[0x51, 0x50]), Err(Error::WrongAnnex));
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn test_taproot_sighash(
         tx_hex: &str,
         prevout_hex: &str,
         input_index: usize,
         expected_hash: &str,
-        sighash_type: SigHashType,
+        sighash_type: SchnorrSighashType,
         annex_hex: Option<&str>,
         script_hex: Option<&str>,
+        script_leaf_hash: Option<&str>,
     ) {
         let tx_bytes = Vec::from_hex(tx_hex).unwrap();
         let tx: Transaction = deserialize(&tx_bytes).unwrap();
@@ -883,29 +1052,164 @@ mod tests {
             None => None,
         };
 
-        let script_inner;
-        let script_path = match script_hex {
-            Some(script_hex) => {
-                script_inner = Script::from_hex(script_hex).unwrap();
-                Some(ScriptPath::with_defaults(&script_inner))
+        let leaf_hash =  match (script_hex, script_leaf_hash) {
+            (Some(script_hex), _) => {
+                let script_inner = Script::from_hex(script_hex).unwrap();
+                Some(ScriptPath::with_defaults(&script_inner).leaf_hash())
             }
-            None => None,
+            (_, Some(script_leaf_hash)) => {
+                Some(TapLeafHash::from_hex(script_leaf_hash).unwrap())
+            }
+            _ => None,
         };
+        // All our tests use the default `0xFFFFFFFF` codeseparator value
+        let leaf_hash = leaf_hash.map(|lh| (lh, 0xFFFFFFFF));
 
         let prevouts = if sighash_type.split_anyonecanpay_flag().1 && tx_bytes[0] % 2 == 0 {
             // for anyonecanpay the `Prevouts::All` variant is good anyway, but sometimes we want to
             // test other codepaths
-            Prevouts::One(input_index, &prevouts[input_index])
+            Prevouts::One(input_index, prevouts[input_index].clone())
         } else {
             Prevouts::All(&prevouts)
         };
 
-        let mut sig_hash_cache = SigHashCache::new(&tx);
+        let mut sighash_cache = SighashCache::new(&tx);
 
-        let hash = sig_hash_cache
-            .taproot_signature_hash(input_index, &prevouts, annex, script_path, sighash_type)
+        let hash = sighash_cache
+            .taproot_signature_hash(input_index, &prevouts, annex, leaf_hash, sighash_type)
             .unwrap();
         let expected = Vec::from_hex(expected_hash).unwrap();
         assert_eq!(expected, hash.into_inner());
+    }
+
+    #[test]
+    fn bip_341_sighash_tests() {
+
+        let data = bip_341_read_json();
+        assert!(data["version"].as_u64().unwrap() == 1u64);
+        let secp = &secp256k1::Secp256k1::new();
+        let key_path = &data["keyPathSpending"].as_array().unwrap()[0];
+
+        let raw_unsigned_tx = hex_decode!(Transaction, key_path["given"]["rawUnsignedTx"].as_str().unwrap());
+        let mut utxos = vec![];
+        for utxo in key_path["given"]["utxosSpent"].as_array().unwrap() {
+            let spk = hex_script!(utxo["scriptPubKey"].as_str().unwrap());
+            let amt = utxo["amountSats"].as_u64().unwrap();
+            utxos.push(TxOut {value: amt, script_pubkey: spk });
+        }
+
+        // Test intermediary
+        let mut cache = SighashCache::new(&raw_unsigned_tx);
+        let expected_amt_hash = key_path["intermediary"]["hashAmounts"].as_str().unwrap();
+        let expected_outputs_hash = key_path["intermediary"]["hashOutputs"].as_str().unwrap();
+        let expected_prevouts_hash = key_path["intermediary"]["hashPrevouts"].as_str().unwrap();
+        let expected_spks_hash = key_path["intermediary"]["hashScriptPubkeys"].as_str().unwrap();
+        let expected_sequences_hash = key_path["intermediary"]["hashSequences"].as_str().unwrap();
+
+        // Compute all caches
+        assert_eq!(expected_amt_hash, cache.taproot_cache(&utxos).amounts.to_hex());
+        assert_eq!(expected_outputs_hash, cache.common_cache().outputs.to_hex());
+        assert_eq!(expected_prevouts_hash, cache.common_cache().prevouts.to_hex());
+        assert_eq!(expected_spks_hash, cache.taproot_cache(&utxos).script_pubkeys.to_hex());
+        assert_eq!(expected_sequences_hash, cache.common_cache().sequences.to_hex());
+
+        for inp in key_path["inputSpending"].as_array().unwrap() {
+            let tx_ind = inp["given"]["txinIndex"].as_u64().unwrap() as usize;
+            let internal_priv_key = hex_hash!(SecretKey, inp["given"]["internalPrivkey"].as_str().unwrap());
+            let merkle_root = if inp["given"]["merkleRoot"].is_null() {
+                None
+            } else {
+                Some(hex_hash!(TapBranchHash, inp["given"]["merkleRoot"].as_str().unwrap()))
+            };
+            let hash_ty = SchnorrSighashType::from_consensus_u8(inp["given"]["hashType"].as_u64().unwrap() as u8).unwrap();
+
+            let expected_internal_pk = hex_hash!(XOnlyPublicKey, inp["intermediary"]["internalPubkey"].as_str().unwrap());
+            let expected_tweak = hex_hash!(TapTweakHash, inp["intermediary"]["tweak"].as_str().unwrap());
+            let expected_tweaked_priv_key = hex_hash!(SecretKey, inp["intermediary"]["tweakedPrivkey"].as_str().unwrap());
+            let expected_sig_msg = Vec::<u8>::from_hex(inp["intermediary"]["sigMsg"].as_str().unwrap()).unwrap();
+            let expected_sighash = hex_hash!(TapSighashHash, inp["intermediary"]["sigHash"].as_str().unwrap());
+            let sig_str = inp["expected"]["witness"][0].as_str().unwrap();
+            let (expected_key_spend_sig, expected_hash_ty) = if sig_str.len() == 128 {
+                (secp256k1::schnorr::Signature::from_str(sig_str).unwrap(), SchnorrSighashType::Default)
+            } else {
+                let hash_ty = SchnorrSighashType::from_consensus_u8(Vec::<u8>::from_hex(&sig_str[128..]).unwrap()[0]).unwrap();
+                (secp256k1::schnorr::Signature::from_str(&sig_str[..128]).unwrap(), hash_ty)
+            };
+
+            // tests
+            let keypair = secp256k1::KeyPair::from_secret_key(secp, internal_priv_key);
+            let internal_key = XOnlyPublicKey::from_keypair(&keypair);
+            let tweak = TapTweakHash::from_key_and_tweak(internal_key, merkle_root);
+            let mut tweaked_keypair = keypair;
+            tweaked_keypair.tweak_add_assign(secp, &tweak).unwrap();
+            let mut sig_msg = Vec::new();
+            cache.taproot_encode_signing_data_to(
+                &mut sig_msg,
+                tx_ind,
+                &Prevouts::All(&utxos),
+                None,
+                None,
+                hash_ty
+            ).unwrap();
+            let sighash = cache.taproot_signature_hash(
+                tx_ind,
+                &Prevouts::All(&utxos),
+                None,
+                None,
+                hash_ty
+            ).unwrap();
+
+            let msg = secp256k1::Message::from_slice(&sighash).unwrap();
+            let key_spend_sig = secp.sign_schnorr_with_aux_rand(&msg, &tweaked_keypair, &[0u8; 32]);
+
+            assert_eq!(expected_internal_pk, internal_key);
+            assert_eq!(expected_tweak, tweak);
+            assert_eq!(expected_sig_msg, sig_msg);
+            assert_eq!(expected_sighash, sighash);
+            assert_eq!(expected_hash_ty, hash_ty);
+            assert_eq!(expected_key_spend_sig, key_spend_sig);
+
+            let tweaked_priv_key = SecretKey::from_keypair(&tweaked_keypair);
+            assert_eq!(expected_tweaked_priv_key, tweaked_priv_key);
+        }
+    }
+
+    fn bip_341_read_json() -> serde_json::Value {
+        let json_str = include_str!("../../test_data/bip341_tests.json");
+        serde_json::from_str(json_str).expect("JSON was not well-formatted")
+    }
+
+    #[test]
+    fn sighashtype_fromstr_display() {
+        let sighashtypes = vec![
+            ("SIGHASH_DEFAULT", SchnorrSighashType::Default),
+            ("SIGHASH_ALL", SchnorrSighashType::All),
+            ("SIGHASH_NONE", SchnorrSighashType::None),
+            ("SIGHASH_SINGLE", SchnorrSighashType::Single),
+            ("SIGHASH_ALL|SIGHASH_ANYONECANPAY", SchnorrSighashType::AllPlusAnyoneCanPay),
+            ("SIGHASH_NONE|SIGHASH_ANYONECANPAY", SchnorrSighashType::NonePlusAnyoneCanPay),
+            ("SIGHASH_SINGLE|SIGHASH_ANYONECANPAY", SchnorrSighashType::SinglePlusAnyoneCanPay),
+        ];
+        for (s, sht) in sighashtypes {
+            assert_eq!(sht.to_string(), s);
+            assert_eq!(SchnorrSighashType::from_str(s).unwrap(), sht);
+        }
+        let sht_mistakes = vec![
+            "SIGHASH_ALL | SIGHASH_ANYONECANPAY",
+            "SIGHASH_NONE |SIGHASH_ANYONECANPAY",
+            "SIGHASH_SINGLE| SIGHASH_ANYONECANPAY",
+            "SIGHASH_ALL SIGHASH_ANYONECANPAY",
+            "SIGHASH_NONE |",
+            "SIGHASH_SIGNLE",
+            "DEFAULT",
+            "ALL",
+            "sighash_none",
+            "Sighash_none",
+            "SigHash_None",
+            "SigHash_NONE",
+        ];
+        for s in sht_mistakes {
+            assert_eq!(SchnorrSighashType::from_str(s).unwrap_err().to_string(), format!("Unrecognized SIGHASH string '{}'", s));
+        }
     }
 }

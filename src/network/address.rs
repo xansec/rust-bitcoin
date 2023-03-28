@@ -18,14 +18,14 @@
 //! network addresses in Bitcoin messages.
 //!
 
-use prelude::*;
+use crate::prelude::*;
 
 use core::{fmt, iter};
 use std::net::{SocketAddr, Ipv6Addr, SocketAddrV4, SocketAddrV6, Ipv4Addr, ToSocketAddrs};
 
-use io;
-use network::constants::ServiceFlags;
-use consensus::encode::{self, Decodable, Encodable, VarInt, ReadExt, WriteExt};
+use crate::io;
+use crate::network::constants::ServiceFlags;
+use crate::consensus::encode::{self, Decodable, Encodable, VarInt, ReadExt, WriteExt};
 
 /// A message which can be sent on the Bitcoin network
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -38,7 +38,7 @@ pub struct Address {
     pub port: u16
 }
 
-const ONION : [u16; 3] = [0xFD87, 0xD87E, 0xEB43];
+const ONION: [u16; 3] = [0xFD87, 0xD87E, 0xEB43];
 
 impl Address {
     /// Create an address message for a socket
@@ -47,7 +47,7 @@ impl Address {
             SocketAddr::V4(addr) => (addr.ip().to_ipv6_mapped().segments(), addr.port()),
             SocketAddr::V6(addr) => (addr.ip().segments(), addr.port())
         };
-        Address { address: address, port: port, services: services }
+        Address { address, port, services }
     }
 
     /// Extract socket address from an [Address] message.
@@ -58,10 +58,7 @@ impl Address {
         if addr[0..3] == ONION {
             return Err(io::Error::from(io::ErrorKind::AddrNotAvailable));
         }
-        let ipv6 = Ipv6Addr::new(
-            addr[0],addr[1],addr[2],addr[3],
-            addr[4],addr[5],addr[6],addr[7]
-        );
+        let ipv6 = Ipv6Addr::new(addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], addr[6], addr[7]);
         if let Some(ipv4) = ipv6.to_ipv4() {
             Ok(SocketAddr::V4(SocketAddrV4::new(ipv4, self.port)))
         } else {
@@ -70,41 +67,44 @@ impl Address {
     }
 }
 
-fn addr_to_be(addr: [u16; 8]) -> [u16; 8] {
-    // consensus_encode always encodes in LE, and we want to encode in BE.
-    // this utility fn swap bytes before encoding so that the encoded result will be BE
-    let mut result = addr.clone();
-    for i in 0..8 {
-        result[i] = result[i].swap_bytes();
-    }
-    result
-}
-
 impl Encodable for Address {
     #[inline]
-    fn consensus_encode<S: io::Write>(
-        &self,
-        mut s: S,
-    ) -> Result<usize, io::Error> {
-        let len = self.services.consensus_encode(&mut s)?
-            + addr_to_be(self.address).consensus_encode(&mut s)?
+    fn consensus_encode<W: io::Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
+        let mut len = self.services.consensus_encode(w)?;
 
-            // consensus_encode always encodes in LE, and we want to encode in BE.
-            //TODO `len += io::Write::write(&mut e, &self.port.to_be_bytes())?;` when MSRV >= 1.32
-            + self.port.swap_bytes().consensus_encode(s)?;
+        for word in &self.address {
+            w.write_all(&word.to_be_bytes())?;
+            len += 2;
+        }
+
+        w.write_all(&self.port.to_be_bytes())?;
+        len += 2;
+
         Ok(len)
     }
 }
 
 impl Decodable for Address {
     #[inline]
-    fn consensus_decode<D: io::Read>(mut d: D) -> Result<Self, encode::Error> {
+    fn consensus_decode<R: io::Read + ?Sized>(r: &mut R) -> Result<Self, encode::Error> {
         Ok(Address {
-            services: Decodable::consensus_decode(&mut d)?,
-            address: addr_to_be(Decodable::consensus_decode(&mut d)?),
-            port: u16::swap_bytes(Decodable::consensus_decode(d)?)
+            services: Decodable::consensus_decode(r)?,
+            address: read_be_address(r)?,
+            port: u16::swap_bytes(Decodable::consensus_decode(r)?)
         })
     }
+}
+
+/// Read a big-endian address from reader.
+fn read_be_address<R: io::Read + ?Sized>(r: &mut R) -> Result<[u16; 8], encode::Error> {
+    let mut address = [0u16; 8];
+    let mut buf = [0u8; 2];
+
+    for word in &mut address {
+        io::Read::read_exact(r, &mut buf)?;
+        *word = u16::from_be_bytes(buf)
+    }
+    Ok(address)
 }
 
 impl fmt::Debug for Address {
@@ -112,9 +112,9 @@ impl fmt::Debug for Address {
         let ipv6 = Ipv6Addr::from(self.address);
 
         match ipv6.to_ipv4() {
-            Some(addr) => write!(f, "Address {{services: {}, address: {}, port: {}}}", 
+            Some(addr) => write!(f, "Address {{services: {}, address: {}, port: {}}}",
                 self.services, addr, self.port),
-            None => write!(f, "Address {{services: {}, address: {}, port: {}}}", 
+            None => write!(f, "Address {{services: {}, address: {}, port: {}}}",
                 self.services, ipv6, self.port)
         }
     }
@@ -147,14 +147,13 @@ pub enum AddrV2 {
 }
 
 impl Encodable for AddrV2 {
-    fn consensus_encode<W: io::Write>(&self, e: W) -> Result<usize, io::Error> {
-        fn encode_addr<W: io::Write>(mut e: W, network: u8, bytes: &[u8]) -> Result<usize, io::Error> {
-                let len = 
-                    network.consensus_encode(&mut e)? +
-                    VarInt(bytes.len() as u64).consensus_encode(&mut e)? +
-                    bytes.len();
-                e.emit_slice(bytes)?;
-                Ok(len)
+    fn consensus_encode<W: io::Write + ?Sized>(&self, e: &mut W) -> Result<usize, io::Error> {
+        fn encode_addr<W: io::Write + ?Sized>(w: &mut W, network: u8, bytes: &[u8]) -> Result<usize, io::Error> {
+            let len = network.consensus_encode(w)?
+                + VarInt(bytes.len() as u64).consensus_encode(w)?
+                + bytes.len();
+            w.emit_slice(bytes)?;
+            Ok(len)
         }
         Ok(match *self {
             AddrV2::Ipv4(ref addr) => encode_addr(e, 1, &addr.octets())?,
@@ -169,9 +168,9 @@ impl Encodable for AddrV2 {
 }
 
 impl Decodable for AddrV2 {
-    fn consensus_decode<D: io::Read>(mut d: D) -> Result<Self, encode::Error> {
-        let network_id = u8::consensus_decode(&mut d)?;
-        let len = VarInt::consensus_decode(&mut d)?.0;
+    fn consensus_decode<R: io::Read + ?Sized>(r: &mut R) -> Result<Self, encode::Error> {
+        let network_id = u8::consensus_decode(r)?;
+        let len = VarInt::consensus_decode(r)?.0;
         if len > 512 {
             return Err(encode::Error::ParseFailed("IP must be <= 512 bytes"));
         }
@@ -180,67 +179,60 @@ impl Decodable for AddrV2 {
                 if len != 4 {
                     return Err(encode::Error::ParseFailed("Invalid IPv4 address"));
                 }
-                let addr: [u8; 4] = Decodable::consensus_decode(&mut d)?;
+                let addr: [u8; 4] = Decodable::consensus_decode(r)?;
                 AddrV2::Ipv4(Ipv4Addr::new(addr[0], addr[1], addr[2], addr[3]))
-            }, 
+            },
             2 => {
                 if len != 16 {
                     return Err(encode::Error::ParseFailed("Invalid IPv6 address"));
                 }
-                let addr: [u16; 8] = addr_to_be(Decodable::consensus_decode(&mut d)?);
+                let addr: [u16; 8] = read_be_address(r)?;
                 if addr[0..3] == ONION {
                     return Err(encode::Error::ParseFailed("OnionCat address sent with IPv6 network id"));
                 }
                 if addr[0..6] == [0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0xFFFF] {
                     return Err(encode::Error::ParseFailed("IPV4 wrapped address sent with IPv6 network id"));
                 }
-                AddrV2::Ipv6(Ipv6Addr::new(
-                    addr[0],addr[1],addr[2],addr[3],
-                    addr[4],addr[5],addr[6],addr[7]
-                ))
-            }, 
+                AddrV2::Ipv6(Ipv6Addr::new(addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], addr[6], addr[7]))
+            },
             3 => {
                 if len != 10 {
                     return Err(encode::Error::ParseFailed("Invalid TorV2 address"));
                 }
-                let id = Decodable::consensus_decode(&mut d)?;
+                let id = Decodable::consensus_decode(r)?;
                 AddrV2::TorV2(id)
             },
             4 => {
                 if len != 32 {
                     return Err(encode::Error::ParseFailed("Invalid TorV3 address"));
                 }
-                let pubkey = Decodable::consensus_decode(&mut d)?;
+                let pubkey = Decodable::consensus_decode(r)?;
                 AddrV2::TorV3(pubkey)
             },
             5 => {
                 if len != 32 {
                     return Err(encode::Error::ParseFailed("Invalid I2P address"));
                 }
-                let hash = Decodable::consensus_decode(&mut d)?;
+                let hash = Decodable::consensus_decode(r)?;
                 AddrV2::I2p(hash)
-            }, 
+            },
             6 => {
                 if len != 16  {
                     return Err(encode::Error::ParseFailed("Invalid CJDNS address"));
                 }
-                let addr: [u16; 8] = Decodable::consensus_decode(&mut d)?;
+                let addr: [u16; 8] = read_be_address(r)?;
                 // check the first byte for the CJDNS marker
-                if addr[0] as u8 != 0xFC {
+                if addr[0] != u16::from_be_bytes([0xFC, 0x00]) {
                     return Err(encode::Error::ParseFailed("Invalid CJDNS address"));
                 }
-                let addr = addr_to_be(addr);
-                AddrV2::Cjdns(Ipv6Addr::new(
-                    addr[0],addr[1],addr[2],addr[3],
-                    addr[4],addr[5],addr[6],addr[7]
-                ))
+                AddrV2::Cjdns(Ipv6Addr::new(addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], addr[6], addr[7]))
             },
             _ => {
                 // len already checked above to be <= 512
                 let mut addr = vec![0u8; len as usize];
-                d.read_slice(&mut addr)?;
+                r.read_slice(&mut addr)?;
                 AddrV2::Unknown(network_id, addr)
-            } 
+            }
         })
     }
 }
@@ -266,32 +258,32 @@ impl AddrV2Message {
         match self.addr {
             AddrV2::Ipv4(addr) => Ok(SocketAddr::V4(SocketAddrV4::new(addr, self.port))),
             AddrV2::Ipv6(addr) => Ok(SocketAddr::V6(SocketAddrV6::new(addr, self.port, 0, 0))),
-            _ => return Err(io::Error::from(io::ErrorKind::AddrNotAvailable)),
+            _ => Err(io::Error::from(io::ErrorKind::AddrNotAvailable)),
         }
     }
 }
 
 impl Encodable for AddrV2Message {
-    fn consensus_encode<W: io::Write>(&self, mut e: W) -> Result<usize, io::Error> {
+    fn consensus_encode<W: io::Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
         let mut len = 0;
-        len += self.time.consensus_encode(&mut e)?;
-        len += VarInt(self.services.as_u64()).consensus_encode(&mut e)?;
-        len += self.addr.consensus_encode(&mut e)?;
+        len += self.time.consensus_encode(w)?;
+        len += VarInt(self.services.to_u64()).consensus_encode(w)?;
+        len += self.addr.consensus_encode(w)?;
 
         // consensus_encode always encodes in LE, and we want to encode in BE.
-        //TODO `len += io::Write::write(&mut e, &self.port.to_be_bytes())?;` when MSRV >= 1.32
-        len += self.port.swap_bytes().consensus_encode(e)?;
+        //TODO `len += io::Write::write(w, &self.port.to_be_bytes())?;` when MSRV >= 1.32
+        len += self.port.swap_bytes().consensus_encode(w)?;
         Ok(len)
-    }   
+    }
 }
 
 impl Decodable for AddrV2Message {
-    fn consensus_decode<D: io::Read>(mut d: D) -> Result<Self, encode::Error> {
-        Ok(AddrV2Message{
-            time: Decodable::consensus_decode(&mut d)?,
-            services: ServiceFlags::from(VarInt::consensus_decode(&mut d)?.0),
-            addr: Decodable::consensus_decode(&mut d)?,
-            port: u16::swap_bytes(Decodable::consensus_decode(d)?),
+    fn consensus_decode<R: io::Read + ?Sized>(r: &mut R) -> Result<Self, encode::Error> {
+        Ok(AddrV2Message {
+            time: Decodable::consensus_decode(r)?,
+            services: ServiceFlags::from(VarInt::consensus_decode(r)?.0),
+            addr: Decodable::consensus_decode(r)?,
+            port: u16::swap_bytes(Decodable::consensus_decode(r)?),
         })
     }
 }
@@ -307,11 +299,11 @@ impl ToSocketAddrs for AddrV2Message {
 mod test {
     use core::str::FromStr;
     use super::{AddrV2Message, AddrV2, Address};
-    use network::constants::ServiceFlags;
+    use crate::network::constants::ServiceFlags;
     use std::net::{SocketAddr, IpAddr, Ipv4Addr, Ipv6Addr};
-    use hashes::hex::FromHex;
+    use crate::hashes::hex::FromHex;
 
-    use consensus::encode::{deserialize, serialize};
+    use crate::consensus::encode::{deserialize, serialize};
 
     #[test]
     fn serialize_address_test() {
@@ -332,7 +324,7 @@ mod test {
                 services: flags.add(ServiceFlags::WITNESS),
                 address: [0, 0, 0, 0, 0, 0xffff, 0x0a00, 0x0001],
                 port: 8333
-            }), 
+            }),
             "The address is: Address {services: ServiceFlags(NETWORK|WITNESS), address: 10.0.0.1, port: 8333}"
         );
 
@@ -341,7 +333,7 @@ mod test {
                 services: ServiceFlags::NETWORK_LIMITED,
                 address: [0xFD87, 0xD87E, 0xEB43, 0, 0, 0xffff, 0x0a00, 0x0001],
                 port: 8333
-            }), 
+            }),
             "The address is: Address {services: ServiceFlags(NETWORK_LIMITED), address: fd87:d87e:eb43::ffff:a00:1, port: 8333}"
         );
     }

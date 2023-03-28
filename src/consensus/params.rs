@@ -18,8 +18,8 @@
 //! chains (such as mainnet, testnet).
 //!
 
-use network::constants::Network;
-use util::uint::Uint256;
+use crate::network::constants::Network;
+use crate::util::uint::Uint256;
 
 /// Lowest possible difficulty for Mainnet. See comment on Params::pow_limit for more info.
 const MAX_BITS_BITCOIN: Uint256 = Uint256([
@@ -50,8 +50,8 @@ const MAX_BITS_REGTEST: Uint256 = Uint256([
     0x7fffff0000000000u64,
 ]);
 
-#[derive(Debug, Clone)]
 /// Parameters that influence chain consensus.
+#[derive(Debug, Clone)]
 pub struct Params {
     /// Network for which parameters are valid.
     pub network: Network,

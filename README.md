@@ -1,10 +1,22 @@
-![Continuous integration](https://github.com/rust-bitcoin/rust-bitcoin/workflows/Continuous%20integration/badge.svg)
-[![Safety Dance](https://img.shields.io/badge/unsafe-forbidden-success.svg)](https://github.com/rust-secure-code/safety-dance/)
+<div align="center">
+  <h1>Rust Bitcoin</h1>
 
-# Rust Bitcoin Library
+  <img alt="Rust Bitcoin logo by Hunter Trujillo, see license and source files under /logo" src="./logo/rust-bitcoin.png" width="300" />
 
-Library with support for de/serialization, parsing and executing on data
-structures and network messages related to Bitcoin.
+  <p>Library with support for de/serialization, parsing and executing on data-structures
+    and network messages related to Bitcoin.
+  </p>
+
+  <p>
+    <a href="https://crates.io/crates/bitcoin"><img alt="Crate Info" src="https://img.shields.io/crates/v/bitcoin.svg"/></a>
+    <a href="https://github.com/rust-bitcoin/rust-bitcoin/blob/master/LICENSE"><img alt="CC0 1.0 Universal Licensed" src="https://img.shields.io/badge/license-CC0--1.0-blue.svg"/></a>
+    <a href="https://github.com/rust-bitcoin/rust-bitcoin/actions?query=workflow%3AContinuous%20integration"><img alt="CI Status" src="https://github.com/rust-bitcoin/rust-bitcoin/workflows/Continuous%20integration/badge.svg"></a>
+    <a href="https://docs.rs/bitcoin"><img alt="API Docs" src="https://img.shields.io/badge/docs.rs-bitcoin-green"/></a>
+    <a href="https://blog.rust-lang.org/2020/02/27/Rust-1.41.1.html"><img alt="Rustc Version 1.41.1+" src="https://img.shields.io/badge/rustc-1.41.1%2B-lightgrey.svg"/></a>
+    <a href="https://gnusha.org/bitcoin-rust/"><img alt="Chat on IRC" src="https://img.shields.io/badge/irc-%23bitcoin--rust%20on%20libera.chat-blue"></a>
+    <img alt="Lines of code" src="https://img.shields.io/tokei/lines/github/rust-bitcoin/rust-bitcoin">
+  </p>
+</div>
 
 [Documentation](https://docs.rs/bitcoin/)
 
@@ -59,25 +71,8 @@ please join us in
 
 ## Minimum Supported Rust Version (MSRV)
 
-This library should always compile with any combination of features on **Rust 1.29**.
-
-Because some dependencies have broken the build in minor/patch releases, to
-compile with 1.29.0 you will need to run the following version-pinning command:
-```
-cargo update -p cc --precise "1.0.41" --verbose
-```
-
-In order to use the `use-serde` feature or to build the unit tests with 1.29.0,
-the following version-pinning commands are also needed:
-```
-cargo update --package "serde" --precise "1.0.98"
-cargo update --package "serde_derive" --precise "1.0.98"
-```
-
-For the feature `base64` to work with 1.29.0 we also need to pin `byteorder`:
-```
-cargo update -p byteorder --precise "1.3.4"
-```
+This library should always compile with any combination of features (minus
+`no-std`) on **Rust 1.41.1** or **Rust 1.47** with `no-std`.
 
 ## Installing Rust
 
@@ -104,7 +99,14 @@ You can run tests with:
 cargo test
 ```
 
-Please refer to the [`cargo` documentation](https://doc.rust-lang.org/stable/cargo/) for more detailed instructions. 
+Please refer to the [`cargo` documentation](https://doc.rust-lang.org/stable/cargo/) for more detailed instructions.
+
+### Building the docs
+
+We build docs with the nightly toolchain, you may wish to use the following
+shell alias to check your documentation changes build correctly.
+
+```alias build-docs='RUSTDOCFLAGS="--cfg docsrs" cargo +nightly rustdoc --features="$FEATURES" -- -D rustdoc::broken-intra-doc-links'```
 
 ## Pull Requests
 
@@ -113,6 +115,26 @@ maintainers and contributors are likely to leave comments and request changes.
 Please try to address them, otherwise your PR might get closed without merging
 after a longer time of inactivity. If your PR isn't ready for review yet please
 mark it by prefixing the title with `WIP: `.
+
+### CI Pipeline
+
+The CI pipeline requires approval before being run on each MR.
+
+In order to speed up the review process the CI pipeline can be run locally using
+[act](https://github.com/nektos/act). The `fuzz` and `Cross` jobs will be
+skipped when using `act` due to caching being unsupported at this time. We do
+not *actively* support `act` but will merge PRs fixing `act` issues.
+
+### Githooks
+
+To assist devs in catching errors _before_ running CI we provide some githooks. If you do not
+already have locally configured githooks you can use the ones in this repository by running, in the
+root directory of the repository:
+```
+git config --local core.hooksPath githooks/
+```
+
+Alternatively add symlinks in your `.git/hooks` directory to any of the githooks we provide.
 
 ## Policy on Altcoins/Altchains
 

@@ -18,15 +18,15 @@
 //! Bitcoin data (blocks and transactions) around.
 //!
 
-use prelude::*;
+use crate::prelude::*;
 
-use io;
+use crate::io;
 
-use hashes::sha256d;
+use crate::hashes::sha256d;
 
-use network::constants;
-use consensus::encode::{self, Decodable, Encodable};
-use hash_types::{BlockHash, Txid, Wtxid};
+use crate::network::constants;
+use crate::consensus::encode::{self, Decodable, Encodable};
+use crate::hash_types::{BlockHash, Txid, Wtxid};
 
 /// An inventory item.
 #[derive(PartialEq, Eq, Clone, Debug, Copy, Hash, PartialOrd, Ord)]
@@ -54,14 +54,10 @@ pub enum Inventory {
 
 impl Encodable for Inventory {
     #[inline]
-    fn consensus_encode<S: io::Write>(
-        &self,
-        mut s: S,
-    ) -> Result<usize, io::Error> {
+    fn consensus_encode<W: io::Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
         macro_rules! encode_inv {
             ($code:expr, $item:expr) => {
-                u32::consensus_encode(&$code, &mut s)? +
-                $item.consensus_encode(&mut s)?
+                u32::consensus_encode(&$code, w)? + $item.consensus_encode(w)?
             }
         }
         Ok(match *self {
@@ -78,18 +74,18 @@ impl Encodable for Inventory {
 
 impl Decodable for Inventory {
     #[inline]
-    fn consensus_decode<D: io::Read>(mut d: D) -> Result<Self, encode::Error> {
-        let inv_type: u32 = Decodable::consensus_decode(&mut d)?;
+    fn consensus_decode<R: io::Read + ?Sized>(r: &mut R) -> Result<Self, encode::Error> {
+        let inv_type: u32 = Decodable::consensus_decode(r)?;
         Ok(match inv_type {
             0 => Inventory::Error,
-            1 => Inventory::Transaction(Decodable::consensus_decode(&mut d)?),
-            2 => Inventory::Block(Decodable::consensus_decode(&mut d)?),
-            5 => Inventory::WTx(Decodable::consensus_decode(&mut d)?),
-            0x40000001 => Inventory::WitnessTransaction(Decodable::consensus_decode(&mut d)?),
-            0x40000002 => Inventory::WitnessBlock(Decodable::consensus_decode(&mut d)?),
+            1 => Inventory::Transaction(Decodable::consensus_decode(r)?),
+            2 => Inventory::Block(Decodable::consensus_decode(r)?),
+            5 => Inventory::WTx(Decodable::consensus_decode(r)?),
+            0x40000001 => Inventory::WitnessTransaction(Decodable::consensus_decode(r)?),
+            0x40000002 => Inventory::WitnessBlock(Decodable::consensus_decode(r)?),
             tp => Inventory::Unknown {
                 inv_type: tp,
-                hash: Decodable::consensus_decode(&mut d)?,
+                hash: Decodable::consensus_decode(r)?,
             }
         })
     }
@@ -128,8 +124,8 @@ impl GetBlocksMessage {
     pub fn new(locator_hashes: Vec<BlockHash>, stop_hash: BlockHash) -> GetBlocksMessage {
         GetBlocksMessage {
             version: constants::PROTOCOL_VERSION,
-            locator_hashes: locator_hashes,
-            stop_hash: stop_hash
+            locator_hashes,
+            stop_hash,
         }
     }
 }
@@ -141,8 +137,8 @@ impl GetHeadersMessage {
     pub fn new(locator_hashes: Vec<BlockHash>, stop_hash: BlockHash) -> GetHeadersMessage {
         GetHeadersMessage {
             version: constants::PROTOCOL_VERSION,
-            locator_hashes: locator_hashes,
-            stop_hash: stop_hash
+            locator_hashes,
+            stop_hash,
         }
     }
 }
@@ -153,9 +149,9 @@ impl_consensus_encoding!(GetHeadersMessage, version, locator_hashes, stop_hash);
 mod tests {
     use super::{Vec, GetHeadersMessage, GetBlocksMessage};
 
-    use hashes::hex::FromHex;
+    use crate::hashes::hex::FromHex;
 
-    use consensus::encode::{deserialize, serialize};
+    use crate::consensus::encode::{deserialize, serialize};
     use core::default::Default;
 
     #[test]

@@ -14,84 +14,59 @@
 
 //! Stream reader.
 //!
-//! This module defines the `StreamReader` struct and its implementation which
-//! is used for parsing an incoming stream into separate `RawNetworkMessage`s,
-//! handling assembling messages from multiple packets, or dealing with partial
-//! or multiple messages in the stream (e.g. when reading from a TCP socket).
+//! Deprecated
+//!
+//! This module defines `StreamReader` struct and its implementation which is used
+//! for parsing incoming stream into separate `Decodable`s, handling assembling
+//! messages from multiple packets or dealing with partial or multiple messages in the stream
+//! (like can happen with reading from TCP socket)
 //!
 
-use prelude::*;
-
 use core::fmt;
-use io::{self, Read};
+use crate::io::{Read, BufReader};
 
-use consensus::{encode, Decodable};
+use crate::consensus::{encode, Decodable};
 
 /// Struct used to configure stream reader function
 pub struct StreamReader<R: Read> {
     /// Stream to read from
-    pub stream: R,
-    /// I/O buffer
-    data: Vec<u8>,
-    /// Buffer containing unparsed message part
-    unparsed: Vec<u8>
+    pub stream: BufReader<R>,
 }
 
 impl<R: Read> fmt::Debug for StreamReader<R> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "StreamReader with buffer_size={} and unparsed content {:?}",
-               self.data.capacity(), self.unparsed)
+        write!(f, "StreamReader")
     }
 }
 
 impl<R: Read> StreamReader<R> {
-    /// Constructs new stream reader for a given input stream `stream` with
-    /// optional parameter `buffer_size` determining reading buffer size
-    pub fn new(stream: R, buffer_size: Option<usize>) -> StreamReader<R> {
+    /// Constructs new stream reader for a given input stream `stream`
+    #[deprecated(since = "0.28.0", note = "wrap your stream into a buffered reader if necessary and use consensus_encode directly")]
+    pub fn new(stream: R, _buffer_size: Option<usize>) -> StreamReader<R> {
         StreamReader {
-            stream,
-            data: vec![0u8; buffer_size.unwrap_or(64 * 1024)],
-            unparsed: vec![]
+            stream: BufReader::new(stream),
         }
     }
 
-    /// Reads stream and parses next message from its current input,
-    /// also taking into account previously unparsed partial message (if there was such).
+    /// Reads stream and parses next message from its current input
+    #[deprecated(since = "0.28.0", note = "wrap your stream into a buffered reader if necessary and use consensus_encode directly")]
     pub fn read_next<D: Decodable>(&mut self) -> Result<D, encode::Error> {
-        loop {
-            match encode::deserialize_partial::<D>(&self.unparsed) {
-                // In this case we just have an incomplete data, so we need to read more
-                Err(encode::Error::Io(ref err)) if err.kind () == io::ErrorKind::UnexpectedEof => {
-                    let count = self.stream.read(&mut self.data)?;
-                    if count > 0 {
-                        self.unparsed.extend(self.data[0..count].iter());
-                    }
-                    else {
-                        return Err(encode::Error::Io(io::Error::from(io::ErrorKind::UnexpectedEof)));
-                    }
-                },
-                Err(err) => return Err(err),
-                // We have successfully read from the buffer
-                Ok((message, index)) => {
-                    self.unparsed.drain(..index);
-                    return Ok(message)
-                },
-            }
-        }
+        Decodable::consensus_decode(&mut self.stream)
     }
 }
 
+#[allow(deprecated)]
 #[cfg(test)]
 mod test {
     use std::thread;
     use std::time::Duration;
-    use io::{self, BufReader, Write};
+    use crate::io::{BufReader, Write};
     use std::net::{TcpListener, TcpStream, Shutdown};
     use std::thread::JoinHandle;
-    use network::constants::ServiceFlags;
+    use crate::network::constants::ServiceFlags;
 
     use super::StreamReader;
-    use network::message::{NetworkMessage, RawNetworkMessage};
+    use crate::network::message::{NetworkMessage, RawNetworkMessage};
 
     // First, let's define some byte arrays for sample messages - dumps are taken from live
     // Bitcoin Core node v0.17.1 with Wireshark
@@ -164,7 +139,7 @@ mod test {
             assert_eq!(version_msg.nonce, 13952548347456104954);
             assert_eq!(version_msg.user_agent, "/Satoshi:0.17.1/");
             assert_eq!(version_msg.start_height, 560275);
-            assert_eq!(version_msg.relay, true);
+            assert!(version_msg.relay);
         } else {
             panic!("Wrong message type: expected VersionMessage");
         }
@@ -191,22 +166,6 @@ mod test {
         } else {
             panic!("Wrong message type: expected AlertMessage");
         }
-    }
-
-    #[test]
-    fn parse_multipartmsg_test() {
-        let stream = io::empty();
-        let mut reader = StreamReader::new(stream, None);
-        reader.unparsed = MSG_ALERT[..24].to_vec();
-        let message: Result<RawNetworkMessage, _> = reader.read_next();
-        assert!(message.is_err());
-        assert_eq!(reader.unparsed.len(), 24);
-
-        reader.unparsed = MSG_ALERT.to_vec();
-        let message = reader.read_next().unwrap();
-        assert_eq!(reader.unparsed.len(), 0);
-
-        check_alert_msg(&message);
     }
 
     #[test]
@@ -244,18 +203,15 @@ mod test {
         // 2. Spawning thread that will be writing our messages to the TCP Stream at the server side
         // in async mode
         let handle = thread::spawn(move || {
-            for ostream in listener.incoming() {
-                let mut ostream = ostream.unwrap();
-
-                for piece in pieces {
-                    ostream.write(&piece[..]).unwrap();
-                    ostream.flush().unwrap();
-                    thread::sleep(Duration::from_secs(1));
-                }
-
-                ostream.shutdown(Shutdown::Both).unwrap();
-                break;
+            // We only simulate a single connection.
+            let mut ostream = listener.incoming().next().unwrap().unwrap();
+            for piece in pieces {
+                ostream.write_all(&piece[..]).unwrap();
+                ostream.flush().unwrap();
+                thread::sleep(Duration::from_secs(1));
             }
+
+            ostream.shutdown(Shutdown::Both).unwrap();
         });
 
         // 3. Creating client side of the TCP socket connection
@@ -263,17 +219,16 @@ mod test {
         let istream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
         let reader = BufReader::new(istream);
 
-        return (handle, reader)
+        (handle, reader)
     }
 
     #[test]
     fn read_multipartmsg_test() {
         // Setting up TCP connection emulation
-        let (handle, istream) = serve_tcp(vec![
+        let (handle, stream) = serve_tcp(vec![
             // single message split in two parts to emulate real network conditions
             MSG_VERSION[..24].to_vec(), MSG_VERSION[24..].to_vec()
         ]);
-        let stream = istream;
         let mut reader = StreamReader::new(stream, None);
 
         // Reading and checking the whole message back
@@ -287,13 +242,12 @@ mod test {
     #[test]
     fn read_sequencemsg_test() {
         // Setting up TCP connection emulation
-        let (handle, istream) = serve_tcp(vec![
+        let (handle, stream) = serve_tcp(vec![
             // Real-world Bitcoin core communication case for /Satoshi:0.17.1/
             MSG_VERSION[..23].to_vec(), MSG_VERSION[23..].to_vec(),
             MSG_VERACK.to_vec(),
             MSG_ALERT[..24].to_vec(), MSG_ALERT[24..].to_vec()
         ]);
-        let stream = istream;
         let mut reader = StreamReader::new(stream, None);
 
         // Reading and checking the first message (Version)
@@ -315,10 +269,10 @@ mod test {
 
     #[test]
     fn read_block_from_file_test() {
-        use io;
-        use consensus::serialize;
-        use hashes::hex::FromHex;
-        use Block;
+        use crate::io;
+        use crate::consensus::serialize;
+        use crate::hashes::hex::FromHex;
+        use crate::Block;
 
         let normal_data = Vec::from_hex("010000004ddccd549d28f385ab457e98d1b11ce80bfea2c5ab93015ade4973e400000000bf4473e53794beae34e64fccc471dace6ae544180816f89591894e0f417a914cd74d6e49ffff001d323b3a7b0201000000010000000000000000000000000000000000000000000000000000000000000000ffffffff0804ffff001d026e04ffffffff0100f2052a0100000043410446ef0102d1ec5240f0d061a4246c1bdef63fc3dbab7733052fbbf0ecd8f41fc26bf049ebb4f9527f374280259e7cfa99c48b0e3f39c51347a19a5819651503a5ac00000000010000000321f75f3139a013f50f315b23b0c9a2b6eac31e2bec98e5891c924664889942260000000049483045022100cb2c6b346a978ab8c61b18b5e9397755cbd17d6eb2fe0083ef32e067fa6c785a02206ce44e613f31d9a6b0517e46f3db1576e9812cc98d159bfdaf759a5014081b5c01ffffffff79cda0945903627c3da1f85fc95d0b8ee3e76ae0cfdc9a65d09744b1f8fc85430000000049483045022047957cdd957cfd0becd642f6b84d82f49b6cb4c51a91f49246908af7c3cfdf4a022100e96b46621f1bffcf5ea5982f88cef651e9354f5791602369bf5a82a6cd61a62501fffffffffe09f5fe3ffbf5ee97a54eb5e5069e9da6b4856ee86fc52938c2f979b0f38e82000000004847304402204165be9a4cbab8049e1af9723b96199bfd3e85f44c6b4c0177e3962686b26073022028f638da23fc003760861ad481ead4099312c60030d4cb57820ce4d33812a5ce01ffffffff01009d966b01000000434104ea1feff861b51fe3f5f8a3b12d0f4712db80e919548a80839fc47c6a21e66d957e9c5d8cd108c7a2d2324bad71f9904ac0ae7336507d785b17a2c115e427a32fac00000000").unwrap();
         let cutoff_data = Vec::from_hex("010000004ddccd549d28f385ab457e98d1b11ce80bfea2c5ab93015ade4973e400000000bf4473e53794beae34e64fccc471dace6ae544180816f89591894e0f417a914cd74d6e49ffff001d323b3a7b0201000000010000000000000000000000000000000000000000000000000000000000000000ffffffff0804ffff001d026e04ffffffff0100f2052a0100000043410446ef0102d1ec5240f0d061a4246c1bdef63fc3dbab7733052fbbf0ecd8f41fc26bf049ebb4f9527f374280259e7cfa99c48b0e3f39c51347a19a5819651503a5ac00000000010000000321f75f3139a013f50f315b23b0c9a2b6eac31e2bec98e5891c924664889942260000000049483045022100cb2c6b346a978ab8c61b18b5e9397755cbd17d6eb2fe0083ef32e067fa6c785a02206ce44e613f31d9a6b0517e46f3db1576e9812cc98d159bfdaf759a5014081b5c01ffffffff79cda0945903627c3da1f85fc95d0b8ee3e76ae0cfdc9a65d09744b1f8fc85430000000049483045022047957cdd957cfd0becd642f6b84d82f49b6cb4c51a91f49246908af7c3cfdf4a022100e96b46621f1bffcf5ea5982f88cef651e9354f5791602369bf5a82a6cd61a62501fffffffffe09f5fe3ffbf5ee97a54eb5e5069e9da6b4856ee86fc52938c2f979b0f38e82000000004847304402204165be9a4cbab8049e1af9723b96199bfd3e85f44c6b4c0177e3962686b26073022028f638da23fc003760861ad481ead4099312c60030d4cb57820ce4d33812a5ce01ffffffff01009d966b01000000434104ea1feff861b51fe3f5f8a3b12d0f4712db80e919548a80839fc47c6a21e66d957e9c5d8cd108c7a2d2324bad71f9904ac0ae7336507d785b17a2c115e427a32fac").unwrap();
@@ -345,5 +299,18 @@ mod test {
 
         // should be also ok for a non-witness block as commitment is optional in that case
         assert!(block.check_witness_commitment());
+    }
+
+    #[test]
+    fn parse_multipartmsg_test() {
+        let mut multi = MSG_ALERT.to_vec();
+        multi.extend(&MSG_ALERT[..]);
+        let mut reader = StreamReader::new(&multi[..], None);
+        let message: Result<RawNetworkMessage, _> = reader.read_next();
+        assert!(message.is_ok());
+        check_alert_msg(&message.unwrap());
+        let message: Result<RawNetworkMessage, _> = reader.read_next();
+        assert!(message.is_ok());
+        check_alert_msg(&message.unwrap());
     }
 }

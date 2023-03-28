@@ -20,29 +20,37 @@
 //! hash).
 //!
 
-use hashes::{Hash, sha256, sha256d, hash160};
+use crate::hashes::{Hash, sha256, sha256d, hash160, hash_newtype};
 
 macro_rules! impl_hashencode {
     ($hashtype:ident) => {
         impl $crate::consensus::Encodable for $hashtype {
-            fn consensus_encode<S: $crate::io::Write>(&self, s: S) -> Result<usize, $crate::io::Error> {
-                self.0.consensus_encode(s)
+            fn consensus_encode<W: $crate::io::Write + ?Sized>(&self, w: &mut W) -> Result<usize, $crate::io::Error> {
+                self.0.consensus_encode(w)
             }
         }
 
         impl $crate::consensus::Decodable for $hashtype {
-            fn consensus_decode<D: $crate::io::Read>(d: D) -> Result<Self, $crate::consensus::encode::Error> {
+            fn consensus_decode<R: $crate::io::Read + ?Sized>(r: &mut R) -> Result<Self, $crate::consensus::encode::Error> {
                 use $crate::hashes::Hash;
-                Ok(Self::from_inner(<<$hashtype as $crate::hashes::Hash>::Inner>::consensus_decode(d)?))
+                Ok(Self::from_inner(<<$hashtype as $crate::hashes::Hash>::Inner>::consensus_decode(r)?))
             }
         }
     }
 }
 
-hash_newtype!(Txid, sha256d::Hash, 32, doc="A bitcoin transaction hash/transaction ID.");
+hash_newtype!(
+    Txid, sha256d::Hash, 32, doc="A bitcoin transaction hash/transaction ID.
+
+For compatibility with the existing Bitcoin infrastructure and historical
+and current versions of the Bitcoin Core software itself, this and
+other [`sha256d::Hash`] types, are serialized in reverse
+byte order when converted to a hex string via [`std::fmt::Display`] trait operations.
+See [`hashes::Hash::DISPLAY_BACKWARD`] for more details.
+");
 hash_newtype!(Wtxid, sha256d::Hash, 32, doc="A bitcoin witness transaction ID.");
 hash_newtype!(BlockHash, sha256d::Hash, 32, doc="A bitcoin block hash.");
-hash_newtype!(SigHash, sha256d::Hash, 32, doc="Hash of the transaction according to the signature algorithm");
+hash_newtype!(Sighash, sha256d::Hash, 32, doc="Hash of the transaction according to the signature algorithm");
 
 hash_newtype!(PubkeyHash, hash160::Hash, 20, doc="A hash of a public key.");
 hash_newtype!(ScriptHash, hash160::Hash, 20, doc="A hash of Bitcoin Script bytecode.");
@@ -60,9 +68,11 @@ hash_newtype!(FilterHeader, sha256d::Hash, 32, doc="Filter header, as defined in
 
 impl_hashencode!(Txid);
 impl_hashencode!(Wtxid);
-impl_hashencode!(SigHash);
 impl_hashencode!(BlockHash);
+impl_hashencode!(Sighash);
+
 impl_hashencode!(TxMerkleNode);
 impl_hashencode!(WitnessMerkleNode);
+
 impl_hashencode!(FilterHash);
 impl_hashencode!(FilterHeader);

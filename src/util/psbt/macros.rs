@@ -17,7 +17,7 @@ macro_rules! hex_psbt {
     ($s:expr) => { $crate::consensus::deserialize::<$crate::util::psbt::PartiallySignedTransaction>(&<$crate::prelude::Vec<u8> as $crate::hashes::hex::FromHex>::from_hex($s).unwrap()) };
 }
 
-macro_rules! merge {
+macro_rules! combine {
     ($thing:ident, $slf:ident, $other:ident) => {
         if let (&None, Some($thing)) = (&$slf.$thing, $other.$thing) {
             $slf.$thing = Some($thing);
@@ -55,11 +55,11 @@ macro_rules! impl_psbt_serialize {
 macro_rules! impl_psbtmap_consensus_encoding {
     ($thing:ty) => {
         impl $crate::consensus::Encodable for $thing {
-            fn consensus_encode<S: $crate::io::Write>(
+            fn consensus_encode<W: $crate::io::Write + ?Sized>(
                 &self,
-                s: S,
+                w: &mut W,
             ) -> Result<usize, $crate::io::Error> {
-                self.consensus_encode_map(s)
+                self.consensus_encode_map(w)
             }
         }
     };
@@ -68,14 +68,14 @@ macro_rules! impl_psbtmap_consensus_encoding {
 macro_rules! impl_psbtmap_consensus_decoding {
     ($thing:ty) => {
         impl $crate::consensus::Decodable for $thing {
-            fn consensus_decode<D: $crate::io::Read>(
-                mut d: D,
+            fn consensus_decode<R: $crate::io::Read + ?Sized>(
+                r: &mut R,
             ) -> Result<Self, $crate::consensus::encode::Error> {
                 let mut rv: Self = ::core::default::Default::default();
 
                 loop {
-                    match $crate::consensus::Decodable::consensus_decode(&mut d) {
-                        Ok(pair) => $crate::util::psbt::Map::insert_pair(&mut rv, pair)?,
+                    match $crate::consensus::Decodable::consensus_decode(r) {
+                        Ok(pair) => rv.insert_pair(pair)?,
                         Err($crate::consensus::encode::Error::Psbt($crate::util::psbt::Error::NoMorePairs)) => return Ok(rv),
                         Err(e) => return Err(e),
                     }
@@ -92,7 +92,7 @@ macro_rules! impl_psbtmap_consensus_enc_dec_oding {
     };
 }
 
-#[cfg_attr(rustfmt, rustfmt_skip)]
+#[rustfmt::skip]
 macro_rules! impl_psbt_insert_pair {
     ($slf:ident.$unkeyed_name:ident <= <$raw_key:ident: _>|<$raw_value:ident: $unkeyed_value_type:ty>) => {
         if $raw_key.key.is_empty() {
@@ -122,10 +122,9 @@ macro_rules! impl_psbt_insert_pair {
     };
 }
 
-
-#[cfg_attr(rustfmt, rustfmt_skip)]
+#[rustfmt::skip]
 macro_rules! impl_psbt_get_pair {
-    ($rv:ident.push($slf:ident.$unkeyed_name:ident as <$unkeyed_typeval:expr, _>|<$unkeyed_value_type:ty>)) => {
+    ($rv:ident.push($slf:ident.$unkeyed_name:ident, $unkeyed_typeval:ident)) => {
         if let Some(ref $unkeyed_name) = $slf.$unkeyed_name {
             $rv.push($crate::util::psbt::raw::Pair {
                 key: $crate::util::psbt::raw::Key {
@@ -136,7 +135,7 @@ macro_rules! impl_psbt_get_pair {
             });
         }
     };
-    ($rv:ident.push($slf:ident.$keyed_name:ident as <$keyed_typeval:expr, $keyed_key_type:ty>|<$keyed_value_type:ty>)) => {
+    ($rv:ident.push_map($slf:ident.$keyed_name:ident, $keyed_typeval:ident)) => {
         for (key, val) in &$slf.$keyed_name {
             $rv.push($crate::util::psbt::raw::Pair {
                 key: $crate::util::psbt::raw::Key {

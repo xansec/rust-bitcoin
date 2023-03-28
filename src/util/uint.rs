@@ -19,7 +19,7 @@
 //!
 
 macro_rules! construct_uint {
-    ($name:ident, $n_words:expr) => (
+    ($name:ident, $n_words:literal) => {
         /// Little-endian large integer type
         #[derive(Copy, Clone, PartialEq, Eq, Hash, Default)]
         pub struct $name(pub [u64; $n_words]);
@@ -138,7 +138,7 @@ macro_rules! construct_uint {
                 let your_bits = other.bits();
 
                 // Check for division by 0
-                assert!(your_bits != 0);
+                assert!(your_bits != 0, "attempted to divide {} by zero", self);
 
                 // Early return in case we are dividing by a larger number than us
                 if my_bits < your_bits {
@@ -169,7 +169,9 @@ macro_rules! construct_uint {
                 let &mut $name(ref mut arr) = self;
                 for i in 0..$n_words {
                     arr[i] = arr[i].wrapping_add(1);
-                    if arr[i] != 0 { break; }
+                    if arr[i] != 0 {
+                        break;
+                    }
                 }
             }
         }
@@ -188,8 +190,12 @@ macro_rules! construct_uint {
                 // and the auto derive is a lexicographic ordering(i.e. memcmp)
                 // which with numbers is equivalent to big-endian
                 for i in 0..$n_words {
-                    if self[$n_words - 1 - i] < other[$n_words - 1 - i] { return ::core::cmp::Ordering::Less; }
-                    if self[$n_words - 1 - i] > other[$n_words - 1 - i] { return ::core::cmp::Ordering::Greater; }
+                    if self[$n_words - 1 - i] < other[$n_words - 1 - i] {
+                        return ::core::cmp::Ordering::Less;
+                    }
+                    if self[$n_words - 1 - i] > other[$n_words - 1 - i] {
+                        return ::core::cmp::Ordering::Greater;
+                    }
                 }
                 ::core::cmp::Ordering::Equal
             }
@@ -413,27 +419,27 @@ macro_rules! construct_uint {
 
         impl $crate::consensus::Encodable for $name {
             #[inline]
-            fn consensus_encode<S: $crate::io::Write>(
+            fn consensus_encode<W: $crate::io::Write + ?Sized>(
                 &self,
-                mut s: S,
+                w: &mut W,
             ) -> Result<usize, $crate::io::Error> {
                 let &$name(ref data) = self;
                 let mut len = 0;
                 for word in data.iter() {
-                    len += word.consensus_encode(&mut s)?;
+                    len += word.consensus_encode(w)?;
                 }
                 Ok(len)
             }
         }
 
         impl $crate::consensus::Decodable for $name {
-            fn consensus_decode<D: $crate::io::Read>(
-                mut d: D,
+            fn consensus_decode<R: $crate::io::Read + ?Sized>(
+                r: &mut R,
             ) -> Result<$name, $crate::consensus::encode::Error> {
                 use $crate::consensus::Decodable;
                 let mut ret: [u64; $n_words] = [0; $n_words];
                 for i in 0..$n_words {
-                    ret[i] = Decodable::consensus_decode(&mut d)?;
+                    ret[i] = Decodable::consensus_decode(r)?;
                 }
                 Ok($name(ret))
             }
@@ -499,15 +505,14 @@ macro_rules! construct_uint {
                 }
             }
         }
-    );
+    };
 }
 
 construct_uint!(Uint256, 4);
 construct_uint!(Uint128, 2);
 
-/// Invalid slice length
+/// Invalid slice length.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Hash)]
-/// Invalid slice length
 pub struct ParseLengthError {
     /// The length of the slice de-facto
     pub actual: usize,
@@ -523,7 +528,11 @@ impl ::core::fmt::Display for ParseLengthError {
 
 #[cfg(feature = "std")]
 #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
-impl ::std::error::Error for ParseLengthError {}
+impl std::error::Error for ParseLengthError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        None
+    }
+}
 
 impl Uint256 {
     /// Decay to a uint128
@@ -536,9 +545,9 @@ impl Uint256 {
 
 #[cfg(test)]
 mod tests {
-    use consensus::{deserialize, serialize};
-    use util::uint::{Uint256, Uint128};
-    use util::BitArray;
+    use crate::consensus::{deserialize, serialize};
+    use crate::util::uint::{Uint256, Uint128};
+    use crate::util::BitArray;
 
     #[test]
     pub fn uint256_bits_test() {

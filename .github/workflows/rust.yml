@@ -7,6 +7,7 @@ jobs:
     name: Tests
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         include:
           - rust: stable
@@ -23,10 +24,14 @@ jobs:
               DO_BENCH: true
               AS_DEPENDENCY: true
               DO_NO_STD: true
-          - rust: 1.29.0
+              DO_DOCS: true
+          - rust: 1.41.1
             env:
               AS_DEPENDENCY: true
-              PIN_VERSIONS: true
+          - rust: 1.47
+            env:
+              AS_DEPENDENCY: true
+              DO_NO_STD: true
     steps:
       - name: Checkout Crate
         uses: actions/checkout@v2
@@ -63,6 +68,7 @@ jobs:
 
   Cross:
     name: Cross testing
+    if: ${{ !github.event.act }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Crate
@@ -80,27 +86,13 @@ jobs:
       - name: run cross test
         run: cross test --target s390x-unknown-linux-gnu
 
-  Docs:
-    name: Docs
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Crate
-        uses: actions/checkout@v2
-      - name: Checkout Toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
-      - name: Create Doc
-        run: cargo doc
   Embedded:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v2
       - name: Set up QEMU
-        run: sudo apt update && sudo apt install qemu-system-arm gcc-arm-none-eabi
+        run: sudo apt update && sudo apt install -y qemu-system-arm gcc-arm-none-eabi
       - name: Checkout Toolchain
         uses: actions-rs/toolchain@v1
         with:
@@ -115,3 +107,18 @@ jobs:
           CARGO_TARGET_THUMBV7M_NONE_EABI_RUNNER: "qemu-system-arm -cpu cortex-m3 -machine mps2-an385 -nographic -semihosting-config enable=on,target=native -kernel"
         run: cd embedded && cargo run --target thumbv7m-none-eabi
 
+  Clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+      - run: rustup component add clippy
+      - uses: actions-rs/cargo@v1
+        with:
+          command: clippy
+          args: --all-features -- -D warnings

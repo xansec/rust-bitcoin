@@ -18,10 +18,6 @@
 //! of Bitcoin data and network messages.
 //!
 
-use io;
-use core::fmt;
-#[cfg(feature = "std")] use std::error;
-
 pub mod constants;
 
 #[cfg(feature = "std")]
@@ -48,42 +44,3 @@ pub mod message_filter;
 #[cfg(feature = "std")]
 #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
 pub mod stream_reader;
-
-/// Network error
-#[derive(Debug)]
-pub enum Error {
-    /// And I/O error
-    Io(io::Error),
-    /// Socket mutex was poisoned
-    SocketMutexPoisoned,
-    /// Not connected to peer
-    SocketNotConnectedToPeer,
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            Error::Io(ref e) => fmt::Display::fmt(e, f),
-            Error::SocketMutexPoisoned => f.write_str("socket mutex was poisoned"),
-            Error::SocketNotConnectedToPeer => f.write_str("not connected to peer"),
-        }
-    }
-}
-
-#[doc(hidden)]
-impl From<io::Error> for Error {
-    fn from(err: io::Error) -> Self {
-        Error::Io(err)
-    }
-}
-
-#[cfg(feature = "std")]
-#[cfg_attr(docsrs, doc(cfg(feature = "std")))]
-impl error::Error for Error {
-    fn cause(&self) -> Option<&dyn error::Error> {
-        match *self {
-            Error::Io(ref e) => Some(e),
-            Error::SocketMutexPoisoned | Error::SocketNotConnectedToPeer => None,
-        }
-    }
-}

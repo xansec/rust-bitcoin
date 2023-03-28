@@ -18,17 +18,18 @@
 //! strings respectively.
 //!
 
-use prelude::*;
+use crate::prelude::*;
 
 use core::{fmt, str, iter, slice};
 
-use hashes::{sha256d, Hash};
+use crate::hashes::{sha256d, Hash, hex};
 use secp256k1;
 
-use util::{endian, key};
+use crate::util::{endian, key};
 
 /// An error that might occur during base58 decoding
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone)]
+#[non_exhaustive]
 pub enum Error {
     /// Invalid character encountered
     BadByte(u8),
@@ -46,6 +47,9 @@ pub enum Error {
     TooShort(usize),
     /// Secp256k1 error while parsing a secret key
     Secp256k1(secp256k1::Error),
+    /// Hex decoding error
+    // TODO: Remove this as part of crate-smashing, there should not be any key related errors in this module
+    Hex(hex::Error)
 }
 
 impl fmt::Display for Error {
@@ -54,17 +58,33 @@ impl fmt::Display for Error {
             Error::BadByte(b) => write!(f, "invalid base58 character 0x{:x}", b),
             Error::BadChecksum(exp, actual) => write!(f, "base58ck checksum 0x{:x} does not match expected 0x{:x}", actual, exp),
             Error::InvalidLength(ell) => write!(f, "length {} invalid for this base58 type", ell),
-            Error::InvalidAddressVersion(ref v) => write!(f, "address version {} is invalid for this base58 type", v),
             Error::InvalidExtendedKeyVersion(ref v) => write!(f, "extended key version {:#04x?} is invalid for this base58 type", v),
+            Error::InvalidAddressVersion(ref v) => write!(f, "address version {} is invalid for this base58 type", v),
             Error::TooShort(_) => write!(f, "base58ck data not even long enough for a checksum"),
-            Error::Secp256k1(ref e) => fmt::Display::fmt(&e, f),
+            Error::Secp256k1(ref e) => write_err!(f, "secp256k1 error while parsing secret key"; e),
+            Error::Hex(ref e) => write_err!(f, "hexadecimal decoding error"; e)
         }
     }
 }
 
 #[cfg(feature = "std")]
 #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
-impl ::std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        use self::Error::*;
+
+        match self {
+            BadByte(_)
+            | BadChecksum(_, _)
+            | InvalidLength(_)
+            | InvalidExtendedKeyVersion(_)
+            | InvalidAddressVersion(_)
+            | TooShort(_) => None,
+            Secp256k1(e) => Some(e),
+            Hex(e) => Some(e),
+        }
+    }
+}
 
 /// Vector-like object that holds the first 100 elements on the stack. If more space is needed it
 /// will be allocated on the heap.
@@ -174,7 +194,7 @@ pub fn from_check(data: &str) -> Result<Vec<u8>, Error> {
 
 fn format_iter<I, W>(writer: &mut W, data: I) -> Result<(), fmt::Error>
 where
-    I: Iterator<Item = u8> + Clone,
+    I: Iterator<Item=u8> + Clone,
     W: fmt::Write
 {
     let mut ret = SmallVec::new();
@@ -215,7 +235,7 @@ where
 
 fn encode_iter<I>(data: I) -> String
 where
-    I: Iterator<Item = u8> + Clone,
+    I: Iterator<Item=u8> + Clone,
 {
     let mut ret = String::new();
     format_iter(&mut ret, data).expect("writing into string shouldn't fail");
@@ -231,7 +251,7 @@ pub fn encode_slice(data: &[u8]) -> String {
 /// Obtain a string with the base58check encoding of a slice
 /// (Tack the first 4 256-digits of the object's Bitcoin hash onto the end.)
 pub fn check_encode_slice(data: &[u8]) -> String {
-    let checksum = sha256d::Hash::hash(&data);
+    let checksum = sha256d::Hash::hash(data);
     encode_iter(
         data.iter()
             .cloned()
@@ -242,7 +262,7 @@ pub fn check_encode_slice(data: &[u8]) -> String {
 /// Obtain a string with the base58check encoding of a slice
 /// (Tack the first 4 256-digits of the object's Bitcoin hash onto the end.)
 pub fn check_encode_slice_to_fmt(fmt: &mut fmt::Formatter, data: &[u8]) -> fmt::Result {
-    let checksum = sha256d::Hash::hash(&data);
+    let checksum = sha256d::Hash::hash(data);
     let iter = data.iter()
         .cloned()
         .chain(checksum[0..4].iter().cloned());
@@ -255,6 +275,8 @@ impl From<key::Error> for Error {
         match e {
             key::Error::Secp256k1(e) => Error::Secp256k1(e),
             key::Error::Base58(e) => e,
+            key::Error::InvalidKeyPrefix(_) => Error::Secp256k1(secp256k1::Error::InvalidPublicKey),
+            key::Error::Hex(e) => Error::Hex(e)
         }
     }
 }
@@ -262,7 +284,7 @@ impl From<key::Error> for Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hashes::hex::FromHex;
+    use crate::hashes::hex::FromHex;
 
     #[test]
     fn test_base58_encode() {
@@ -277,7 +299,7 @@ mod tests {
         assert_eq!(&encode_slice(&[0, 0, 0, 0, 13, 36][..]), "1111211");
 
         // Long input (>100 bytes => has to use heap)
-        let res = encode_slice(&"BitcoinBitcoinBitcoinBitcoinBitcoinBitcoinBitcoinBitcoinBitcoinBit\
+        let res = encode_slice("BitcoinBitcoinBitcoinBitcoinBitcoinBitcoinBitcoinBitcoinBitcoinBit\
         coinBitcoinBitcoinBitcoinBitcoinBitcoinBitcoinBitcoinBitcoinBitcoinBitcoin".as_bytes());
         let exp = "ZqC5ZdfpZRi7fjA8hbhX5pEE96MdH9hEaC1YouxscPtbJF16qVWksHWR4wwvx7MotFcs2ChbJqK8KJ9X\
         wZznwWn1JFDhhTmGo9v6GjAVikzCsBWZehu7bm22xL8b5zBR5AsBygYRwbFJsNwNkjpyFuDKwmsUTKvkULCvucPJrN5\
@@ -287,10 +309,10 @@ mod tests {
         // Addresses
         let addr = Vec::from_hex("00f8917303bfa8ef24f292e8fa1419b20460ba064d").unwrap();
         assert_eq!(&check_encode_slice(&addr[..]), "1PfJpZsjreyVrqeoAfabrRwwjQyoSQMmHH");
-      }
+    }
 
-      #[test]
-      fn test_base58_decode() {
+    #[test]
+    fn test_base58_decode() {
         // Basics
         assert_eq!(from("1").ok(), Some(vec![0u8]));
         assert_eq!(from("2").ok(), Some(vec![1u8]));
